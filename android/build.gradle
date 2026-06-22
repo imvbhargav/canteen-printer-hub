@@ -1,3 +1,4 @@
+org.gradle.api.artifacts.dsl.RepositoryHandler.metaClass.jcenter = { -> delegate.mavenCentral() }
 buildscript {
     ext {
         buildToolsVersion = "36.0.0"
