@@ -1085,12 +1085,30 @@ export default function App(): React.JSX.Element {
 
                         try {
                           headlessPrintingLocks[printerAddress] = true;
+
+                          const storedPrintersRaw: string | null =
+                            await AsyncStorage.getItem('@discovered_printers');
+                          const cachedPrinters: DiscoveredPrinter[] =
+                            storedPrintersRaw
+                              ? (JSON.parse(
+                                  storedPrintersRaw,
+                                ) as DiscoveredPrinter[])
+                              : [];
+
+                          const matchedPrinterDevice:
+                            | DiscoveredPrinter
+                            | undefined = cachedPrinters.find(
+                            (dp: DiscoveredPrinter) =>
+                              dp.address === printerAddress,
+                          );
+
                           await executePrintJob(
                             matchedCounter.printerType as 'LAN' | 'BT' | 'USB',
                             printerAddress,
                             actionableTicket,
-                            undefined,
+                            matchedPrinterDevice, // No longer undefined
                           );
+
                           await updateJournalTicketStatus(
                             actionableTicket.orderId,
                             'COMPLETED',
@@ -1334,6 +1352,11 @@ export default function App(): React.JSX.Element {
         return prev;
       const next: DiscoveredPrinter[] = [...prev, device];
       discoveredPrintersRef.current = next;
+
+      AsyncStorage.setItem('@discovered_printers', JSON.stringify(next)).catch(
+        () => {},
+      );
+
       return next;
     });
   };

@@ -100,14 +100,13 @@ const resolveConnectedDevice = async (
   let device: ThermalPrinterDevice | undefined = activeConnections.get(address);
   let needsStabilization: boolean = false;
 
-  // 1. Check the Keep-Alive Pool FIRST (For rapid Pusher events)
   if (device) {
     if (device.isConnected()) {
       writeLog(
         'INFO',
         `[${type}] Reusing warm connection to ${address}. Instant print.`,
       );
-      return device; // FAST PATH: 0-second delay
+      return device;
     } else {
       writeLog(
         'WARN',
@@ -118,44 +117,76 @@ const resolveConnectedDevice = async (
     }
   }
 
-  // 2. Fallback to Discovered Instance (For the "TEST" button on unlinked devices)
   if (!device && discovered?._device) {
     writeLog(
       'INFO',
       `[${type}] Using fresh instance from scanner. Connecting...`,
     );
     device = discovered._device;
-    if (!device.isConnected()) {
-      await withTimeout(
-        device.connect({ timeout: 8000 }),
-        8500,
-        `Instance connection to ${address} timed out or deadlocked.`,
+  }
+
+  if (!device && type === 'BT') {
+    writeLog(
+      'INFO',
+      `[BT] Headless cold-start detected. Verifying system bonding records for MAC: ${address}`,
+    );
+    try {
+      const pairedDevices: any[] = await ReactNativePosPrinter.getDeviceList();
+      const isPaired: boolean = pairedDevices.some(
+        (d: any) => d.macAddress === address || d.address === address,
       );
-      needsStabilization = true;
+
+      if (!isPaired) {
+        writeLog(
+          'WARN',
+          `[BT] Device ${address} is not paired in Android system settings.`,
+        );
+      } else {
+        writeLog(
+          'INFO',
+          `[BT] Verified device pairing trace in system adapter registry.`,
+        );
+      }
+    } catch (adapterErr: unknown) {
+      writeLog(
+        'ERROR',
+        `[BT] Native adapter verification exception: ${String(adapterErr)}`,
+      );
     }
   }
 
-  // 3. Absolute Cold Start (For registered counters on fresh app boot)
   if (!device) {
     writeLog(
       'INFO',
-      `[${type}] No instance available for ${address}. Calling static connectPrinter...`,
+      `[${type}] Executing native initialization driver channel factory for ${address}...`,
     );
     device = await withTimeout(
       ReactNativePosPrinter.connectPrinter(address, { timeout: 8000 }),
       8500,
-      `Static connection to ${address} timed out or deadlocked.`,
+      `Static connection wrapper allocation to ${address} timed out or deadlocked.`,
     );
     needsStabilization = true;
   }
 
   if (!device) {
     throw new Error(
-      `[${type}] Could not resolve device instance for ${address}`,
+      `[${type}] Could not resolve device instance reference allocations for ${address}`,
     );
   }
 
-  // 4. Pay the stabilization tax ONLY if we just opened the socket
+  if (!device.isConnected()) {
+    writeLog(
+      'INFO',
+      `[${type}] Direct pipe link closed. Forcing connection thread descriptor...`,
+    );
+    await withTimeout(
+      device.connect({ timeout: 8000 }),
+      8500,
+      `Instance connection step to ${address} timed out or deadlocked.`,
+    );
+    needsStabilization = true;
+  }
+
   if (needsStabilization) {
     writeLog(
       'INFO',
@@ -164,17 +195,11 @@ const resolveConnectedDevice = async (
     await sleep(1000);
   }
 
-  // Synchronous hardware verification
   if (!device.isConnected()) {
     throw new Error(`[${type}] Connection rejected by printer hardware.`);
   }
 
-  // 5. Save to pool for future live orders
   activeConnections.set(address, device);
-  if (needsStabilization) {
-    writeLog('INFO', `[${type}] Socket stable and pooled for future orders.`);
-  }
-
   return device;
 };
 
