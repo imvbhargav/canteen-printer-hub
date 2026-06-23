@@ -27,7 +27,10 @@ import {
   DiscoveredPrinter,
 } from './utils/printerDiscovery';
 import { writeLog, readTodayLogs, LogEntry } from './utils/logger';
-import { executePrintJob } from './utils/printerTransport';
+import {
+  executePrintJob,
+  warmPrinterConnection,
+} from './utils/printerTransport';
 import {
   readJournalTickets,
   updateJournalTicketStatus,
@@ -36,6 +39,7 @@ import {
 } from './utils/ticketStorage';
 import ReactNativeForegroundService from '@supersami/rn-foreground-service';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { getEngineConfig, promptForEngineConfig } from './utils/engineConfig';
 
 if (
   Platform.OS === 'android' &&
@@ -586,6 +590,10 @@ const TicketCard = ({
     bg: theme.surfaceAlt,
   };
 
+  // Calculate if the 10-minute retry window is still valid
+  const orderTime = item.createdAt ? new Date(item.createdAt).getTime() : 0;
+  const isRetryAllowed = Date.now() - orderTime < 10 * 60 * 1000;
+
   return (
     <View style={ticketStyles.card}>
       <View style={ticketStyles.header}>
@@ -609,7 +617,8 @@ const TicketCard = ({
           </View>
         ))}
       </View>
-      {item.status !== 'COMPLETED' && (
+      {/* Hide retry button entirely if order status is COMPLETED or if the 10-min window expired */}
+      {item.status !== 'COMPLETED' && isRetryAllowed && (
         <TouchableOpacity style={ticketStyles.retryBtn} onPress={onRetry}>
           <Text style={ticketStyles.retryText}>↺ RETRY SYSTEM PRINT</Text>
         </TouchableOpacity>
@@ -815,6 +824,22 @@ export default function App(): React.JSX.Element {
   };
 
   const executePrint = useCallback(async (ticket: Ticket): Promise<void> => {
+    // Time-window guard
+    const orderTime = ticket.createdAt
+      ? new Date(ticket.createdAt).getTime()
+      : 0;
+    if (Date.now() - orderTime >= 10 * 60 * 1000) {
+      writeLog(
+        'WARN',
+        `[PRINT] Manual retry rejected for order ${ticket.orderId} — exceeded 10-minute threshold.`,
+      );
+      Alert.alert(
+        'Timeout Expired',
+        'This order is too old to be reprinted from the tablet engine.',
+      );
+      return;
+    }
+
     const targetCounter: CounterConfig | undefined = countersRef.current.find(
       (c: CounterConfig) =>
         c.id === ticket.counterId &&
@@ -833,28 +858,63 @@ export default function App(): React.JSX.Element {
       return;
     }
 
-    try {
-      const cachedPrinter: DiscoveredPrinter | undefined =
-        discoveredPrintersRef.current.find(
-          (dp: DiscoveredPrinter) =>
-            dp.address === targetCounter.printerAddress,
+    // Auto-Retry Matrix Execution Loop
+    const MAX_ATTEMPTS = 3;
+    let lastError: unknown = null;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        writeLog(
+          'INFO',
+          `[PRINT-PIPELINE] Dispatching print job for ${ticket.orderId} (Attempt ${attempt}/${MAX_ATTEMPTS})`,
         );
-      await runHardwarePrint(
-        targetCounter.printerType,
-        targetCounter.printerAddress,
-        ticket,
-        cachedPrinter,
-      );
-      await updateJournalTicketStatus(ticket.orderId, 'COMPLETED');
-      DeviceEventEmitter.emit('JOURNAL_UPDATED');
-    } catch (err: unknown) {
-      writeLog(
-        'ERROR',
-        `[PRINT] Failed for "${targetCounter.displayName}": ${String(err)}`,
-      );
-      await updateJournalTicketStatus(ticket.orderId, 'CANCELLED');
-      DeviceEventEmitter.emit('JOURNAL_UPDATED');
+
+        const cachedPrinter: DiscoveredPrinter | undefined =
+          discoveredPrintersRef.current.find(
+            (dp: DiscoveredPrinter) =>
+              dp.address === targetCounter.printerAddress,
+          );
+
+        await runHardwarePrint(
+          targetCounter.printerType,
+          targetCounter.printerAddress,
+          ticket,
+          cachedPrinter,
+        );
+
+        // Success: Mark complete and exit the execution ring cleanly
+        await updateJournalTicketStatus(ticket.orderId, 'COMPLETED');
+        DeviceEventEmitter.emit('JOURNAL_UPDATED');
+        return;
+      } catch (err: unknown) {
+        lastError = err;
+        writeLog(
+          'WARN',
+          `[PRINT-PIPELINE] Attempt ${attempt} failed for "${
+            targetCounter.displayName
+          }": ${String(err)}`,
+        );
+
+        // If we have remaining attempts, cool down the driver stack for 2 seconds before retrying
+        if (attempt < MAX_ATTEMPTS) {
+          await new Promise<void>(resolve => setTimeout(() => resolve(), 2000));
+        }
+      }
     }
+
+    // Exhausted Path: Executes only if all 3 attempts hit the catch block
+    writeLog(
+      'ERROR',
+      `[PRINT-PIPELINE] All ${MAX_ATTEMPTS} print cycles exhausted for ${ticket.orderId}. Marking as failed.`,
+    );
+    await updateJournalTicketStatus(ticket.orderId, 'CANCELLED');
+    DeviceEventEmitter.emit('JOURNAL_UPDATED');
+    Alert.alert(
+      'Print Failed',
+      `Could not print after ${MAX_ATTEMPTS} attempts. Error: ${String(
+        lastError,
+      )}`,
+    );
   }, []);
 
   const ensureNotificationPermission = async (): Promise<boolean> => {
@@ -913,6 +973,18 @@ export default function App(): React.JSX.Element {
       return;
     }
 
+    // ─── Verification code lifted out of the execution blocks ───
+    let currentConfig = await getEngineConfig();
+    if (!currentConfig) {
+      try {
+        currentConfig = await promptForEngineConfig();
+      } catch {
+        writeLog('WARN', '[SYSTEM] Engine initialization aborted by operator.');
+        return;
+      }
+    }
+    const verifiedConfig = currentConfig;
+
     const hasNotifPermission: boolean = await ensureNotificationPermission();
     if (!hasNotifPermission) {
       writeLog(
@@ -939,6 +1011,48 @@ export default function App(): React.JSX.Element {
       ReactNativeForegroundService.add_task(
         async () => {
           try {
+            writeLog(
+              'INFO',
+              `[ENGINE] Synchronizing cluster token for node ${verifiedConfig.id}...`,
+            );
+            const enginePingResponse = await fetch(
+              'https://cm-bps.vercel.app/api/engine/ping',
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  engineId: verifiedConfig.id,
+                  priority: verifiedConfig.priority,
+                }),
+              },
+            );
+
+            if (!enginePingResponse.ok) {
+              const pingErrResult = await enginePingResponse
+                .json()
+                .catch(() => ({ error: 'Unknown system clash' }));
+              writeLog(
+                'ERROR',
+                `[CLUSTER-CONFLICT] Assertion failed: ${pingErrResult.error}`,
+              );
+
+              ReactNativeForegroundService.remove_task(
+                'printerOrderPollingTask',
+              );
+              await ReactNativeForegroundService.stop();
+              setIsServerRunning(false);
+              setEngineStatus({
+                connected: false,
+                channels: [],
+                updatedAt: '',
+              });
+              Alert.alert(
+                'Cluster Preemption',
+                pingErrResult.error || 'A higher priority engine dominates.',
+              );
+              return;
+            }
+
             writeLog('INFO', '[API] Resolving counter endpoint allocation...');
             const response: Response = await fetch(
               'https://cm-bps.vercel.app/api/counters',
@@ -955,6 +1069,25 @@ export default function App(): React.JSX.Element {
 
             const activeCounters: CounterConfig[] =
               result.data as CounterConfig[];
+
+            writeLog(
+              'INFO',
+              '[WARMUP] Initiating eager hardware pooling phase...',
+            );
+            for (const counter of activeCounters) {
+              if (
+                !counter.printerAddress ||
+                counter.printerType === 'NONE' ||
+                counter.printerType === 'LAN'
+              ) {
+                continue;
+              }
+              await warmPrinterConnection(
+                counter.printerType as 'BT' | 'USB',
+                counter.printerAddress,
+              );
+            }
+
             const nativePusher: Pusher = Pusher.getInstance();
             const headlessPrintingLocks: Record<string, boolean> = {};
 
@@ -1061,18 +1194,9 @@ export default function App(): React.JSX.Element {
                         try {
                           headlessPrintingLocks[printerAddress] = true;
 
-                          const storedPrintersRaw: string | null =
-                            await AsyncStorage.getItem('@discovered_printers');
-                          const cachedPrinters: DiscoveredPrinter[] =
-                            storedPrintersRaw
-                              ? (JSON.parse(
-                                  storedPrintersRaw,
-                                ) as DiscoveredPrinter[])
-                              : [];
-
                           const matchedPrinterDevice:
                             | DiscoveredPrinter
-                            | undefined = cachedPrinters.find(
+                            | undefined = discoveredPrintersRef.current.find(
                             (dp: DiscoveredPrinter) =>
                               dp.address === printerAddress,
                           );
@@ -1081,7 +1205,7 @@ export default function App(): React.JSX.Element {
                             matchedCounter.printerType as 'LAN' | 'BT' | 'USB',
                             printerAddress,
                             actionableTicket,
-                            matchedPrinterDevice, // No longer undefined
+                            matchedPrinterDevice,
                           );
 
                           await updateJournalTicketStatus(
@@ -1323,15 +1447,11 @@ export default function App(): React.JSX.Element {
 
   const addDiscoveredPrinter = (device: DiscoveredPrinter): void => {
     setDiscoveredPrinters((prev: DiscoveredPrinter[]) => {
-      if (prev.find((p: DiscoveredPrinter) => p.address === device.address))
+      if (prev.find((p: DiscoveredPrinter) => p.address === device.address)) {
         return prev;
+      }
       const next: DiscoveredPrinter[] = [...prev, device];
       discoveredPrintersRef.current = next;
-
-      AsyncStorage.setItem('@discovered_printers', JSON.stringify(next)).catch(
-        () => {},
-      );
-
       return next;
     });
   };
@@ -1343,7 +1463,6 @@ export default function App(): React.JSX.Element {
     const initPipeline = async (): Promise<void> => {
       writeLog('INFO', '=== SYSTEM BOOT SEQUENCE START ===');
 
-      // HARD DEFENSIVE TEARDOWN: Clean up remnants of killed app states
       try {
         writeLog(
           'WARN',
@@ -1357,9 +1476,13 @@ export default function App(): React.JSX.Element {
 
       await clearStaleJournalTickets();
 
-      // Initialize Pusher exactly once per application instance lifetime
       try {
-        const nativePusher = Pusher.getInstance();
+        const nativePusher: Pusher = Pusher.getInstance();
+
+        try {
+          await nativePusher.disconnect();
+        } catch {}
+
         await nativePusher.init({
           apiKey: 'de978c89a0a60f82aefd',
           cluster: 'ap2',

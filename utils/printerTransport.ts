@@ -9,35 +9,36 @@ import net from 'react-native-tcp-socket';
 import { Ticket } from '../types';
 import { generateReceiptBytes, formatPrice } from './printerUtils';
 
-// Memory pool to keep hardware sockets open between Pusher events
-const activeConnections = new Map<string, ThermalPrinterDevice>();
+const activeConnections: Map<string, ThermalPrinterDevice> = new Map<
+  string,
+  ThermalPrinterDevice
+>();
 
 const sleep = (ms: number): Promise<void> =>
-  new Promise<void>(resolve => setTimeout(() => resolve(), ms));
+  new Promise<void>((resolve: () => void) => setTimeout(() => resolve(), ms));
 
-/**
- * Strict JS-level timeout wrapper to protect against native module deadlocks.
- */
 const withTimeout = <T>(
   promise: Promise<T>,
   ms: number,
   fallbackError: string,
 ): Promise<T> => {
-  return new Promise((resolve, reject) => {
-    const timer: ReturnType<typeof setTimeout> = setTimeout(
-      () => reject(new Error(fallbackError)),
-      ms,
-    );
-    promise
-      .then(res => {
-        clearTimeout(timer);
-        resolve(res);
-      })
-      .catch(err => {
-        clearTimeout(timer);
-        reject(err);
-      });
-  });
+  return new Promise<T>(
+    (resolve: (value: T) => void, reject: (reason?: any) => void) => {
+      const timer: ReturnType<typeof setTimeout> = setTimeout(
+        () => reject(new Error(fallbackError)),
+        ms,
+      );
+      promise
+        .then((res: T) => {
+          clearTimeout(timer);
+          resolve(res);
+        })
+        .catch((err: unknown) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+    },
+  );
 };
 
 const sendLAN = (address: string, bytes: Uint8Array): Promise<void> => {
@@ -68,8 +69,9 @@ const sendLAN = (address: string, bytes: Uint8Array): Promise<void> => {
         );
       }, 10000);
 
-      const client: ReturnType<typeof net.createConnection> =
-        net.createConnection({ host, port, tls: false }, () => {
+      const client: net.Socket = net.createConnection(
+        { host, port, tls: false },
+        () => {
           clearTimeout(timer);
           writeLog('INFO', `[LAN] Connected. Sending ${bytes.length} bytes...`);
 
@@ -80,7 +82,8 @@ const sendLAN = (address: string, bytes: Uint8Array): Promise<void> => {
             writeLog('INFO', '[LAN] Done. Socket closed.');
             settle(resolve);
           }, 800);
-        });
+        },
+      );
 
       client.on('error', (err: Error) => {
         clearTimeout(timer);
@@ -91,7 +94,6 @@ const sendLAN = (address: string, bytes: Uint8Array): Promise<void> => {
   );
 };
 
-// Intelligently routes traffic to warm sockets, scanner instances, or cold starts.
 const resolveConnectedDevice = async (
   type: 'BT' | 'USB',
   address: string,
@@ -125,42 +127,12 @@ const resolveConnectedDevice = async (
     device = discovered._device;
   }
 
-  if (!device && type === 'BT') {
-    writeLog(
-      'INFO',
-      `[BT] Headless cold-start detected. Verifying system bonding records for MAC: ${address}`,
-    );
-    try {
-      const pairedDevices: any[] = await ReactNativePosPrinter.getDeviceList();
-      const isPaired: boolean = pairedDevices.some(
-        (d: any) => d.macAddress === address || d.address === address,
-      );
-
-      if (!isPaired) {
-        writeLog(
-          'WARN',
-          `[BT] Device ${address} is not paired in Android system settings.`,
-        );
-      } else {
-        writeLog(
-          'INFO',
-          `[BT] Verified device pairing trace in system adapter registry.`,
-        );
-      }
-    } catch (adapterErr: unknown) {
-      writeLog(
-        'ERROR',
-        `[BT] Native adapter verification exception: ${String(adapterErr)}`,
-      );
-    }
-  }
-
   if (!device) {
     writeLog(
       'INFO',
-      `[${type}] Executing native initialization driver channel factory for ${address}...`,
+      `[${type}] Cold start route triggered. Mounting driver channel: ${address}`,
     );
-    device = await withTimeout(
+    device = await withTimeout<ThermalPrinterDevice>(
       ReactNativePosPrinter.connectPrinter(address, { timeout: 8000 }),
       8500,
       `Static connection wrapper allocation to ${address} timed out or deadlocked.`,
@@ -179,7 +151,7 @@ const resolveConnectedDevice = async (
       'INFO',
       `[${type}] Direct pipe link closed. Forcing connection thread descriptor...`,
     );
-    await withTimeout(
+    await withTimeout<void>(
       device.connect({ timeout: 8000 }),
       8500,
       `Instance connection step to ${address} timed out or deadlocked.`,
@@ -190,9 +162,22 @@ const resolveConnectedDevice = async (
   if (needsStabilization) {
     writeLog(
       'INFO',
-      `[${type}] Hardware socket opening... stabilizing for 1s.`,
+      `[${type}] Hardware socket opening... stabilizing channel for 2s.`,
     );
-    await sleep(1000);
+    await sleep(2000);
+
+    if (!device.isConnected()) {
+      writeLog(
+        'WARN',
+        `[${type}] Target port unready after baseline sleep. Forcing step-down connection retry cycle...`,
+      );
+      await withTimeout<void>(
+        device.connect({ timeout: 8000 }),
+        8500,
+        'Fallback hardware retry descriptor timed out',
+      );
+      await sleep(1000);
+    }
   }
 
   if (!device.isConnected()) {
@@ -208,7 +193,7 @@ const sendViaDeviceNative = async (
   address: string,
   ticket: Ticket,
   discovered?: DiscoveredPrinter,
-  paperWidth: number = 48, // Increased default from 32 to 48 for standard 80mm layouts
+  paperWidth: number = 48,
 ): Promise<void> => {
   const device: ThermalPrinterDevice = await resolveConnectedDevice(
     type,
@@ -222,15 +207,13 @@ const sendViaDeviceNative = async (
     const underlineSeparator: string = '_'.repeat(paperWidth);
     const dashSeparator: string = '-'.repeat(paperWidth);
 
-    // Structural Header Blocks
     await device.printText('BMSCW CANTEEN\n', { align: 'CENTER', bold: true });
     await device.printText('Basavanagudi\n', { align: 'CENTER' });
     await device.printText('+91 77607 62484\n', { align: 'CENTER' });
     await device.printText(`${underlineSeparator}\n`, { align: 'LEFT' });
 
-    // Timestamps Metadata Attributes
-    const timestamp = new Date();
-    const dateStr: string = timestamp.toLocaleDateString('en-GB'); // DD/MM/YYYY
+    const timestamp: Date = new Date();
+    const dateStr: string = timestamp.toLocaleDateString('en-GB');
     const timeStr: string = timestamp.toLocaleTimeString('en-US', {
       hour: '2-digit',
       minute: '2-digit',
@@ -240,27 +223,24 @@ const sendViaDeviceNative = async (
       align: 'LEFT',
     });
 
-    // Cleaned Token Block: Exclusively rely on ticketReference and modify label hierarchy
     const tokenNo: string = ticket.ticketReference || 'XXXX';
     await device.printText(`Order No / Token No : ${tokenNo}\n`, {
       align: 'LEFT',
     });
     await device.printText(`${dashSeparator}\n`, { align: 'LEFT' });
 
-    // Grid Row Header Definition Column Mapping Rules
-    const amtColWidth = 8; // Expanded spacing mapping bounds
-    const qtyColWidth = 6; // Expanded spacing mapping bounds
-    const itemNameWidth = paperWidth - amtColWidth - qtyColWidth;
+    const amtColWidth: number = 8;
+    const qtyColWidth: number = 6;
+    const itemNameWidth: number = paperWidth - amtColWidth - qtyColWidth;
 
-    const headerItem = 'Item'.padEnd(itemNameWidth, ' ');
-    const headerQty = 'Qty'.padStart(qtyColWidth, ' ');
-    const headerAmt = 'Amt'.padStart(amtColWidth, ' ');
+    const headerItem: string = 'Item'.padEnd(itemNameWidth, ' ');
+    const headerQty: string = 'Qty'.padStart(qtyColWidth, ' ');
+    const headerAmt: string = 'Amt'.padStart(amtColWidth, ' ');
     await device.printText(`${headerItem}${headerQty}${headerAmt}\n`, {
       align: 'LEFT',
     });
     await device.printText(`${dashSeparator}\n`, { align: 'LEFT' });
 
-    // Transform and Print Item Rows
     for (const item of ticket.items || []) {
       const cleanAmt: string = formatPrice(item.itemTotal);
       const cleanQty: string = String(item.quantity);
@@ -280,8 +260,7 @@ const sendViaDeviceNative = async (
       });
     }
 
-    // Grand Totals Formatting Block
-    const totalLabel = 'TOTAL'.padEnd(paperWidth - 10, ' ');
+    const totalLabel: string = 'TOTAL'.padEnd(paperWidth - 10, ' ');
     const rawNetTotal: string = ticket.netTotal || '0.00';
     const totalAmountFormatted: string = `\u20B9${formatPrice(rawNetTotal)}`;
     const totalValRight: string = totalAmountFormatted.padStart(10, ' ');
@@ -293,7 +272,6 @@ const sendViaDeviceNative = async (
     });
     await device.printText(`${dashSeparator}\n\n\n`, { align: 'LEFT' });
 
-    // Status Queries & Hardware Cut Handlers
     const status: { online: boolean; paperOut: boolean } =
       await device.getStatus();
     if (status.online && !status.paperOut) {
@@ -318,14 +296,40 @@ export const executePrintJob = async (
 
   switch (type) {
     case 'LAN':
-      // Uses the ESC/POS payload compiler (which also uses the updated width configuration now)
       const bytes: Uint8Array = generateReceiptBytes(ticket, 48);
       return sendLAN(address, bytes);
     case 'BT':
     case 'USB':
-      // Invokes native connection execution directly
       return sendViaDeviceNative(type, address, ticket, discovered, 48);
     default:
       throw new Error(`[TRANSPORT] Unknown printer type: ${type}`);
+  }
+};
+
+export const warmPrinterConnection = async (
+  type: 'BT' | 'USB',
+  address: string,
+): Promise<void> => {
+  try {
+    writeLog('INFO', `[WARMUP] Pre-connecting ${type}[${address}]`);
+
+    const device: ThermalPrinterDevice =
+      await withTimeout<ThermalPrinterDevice>(
+        ReactNativePosPrinter.connectPrinter(address, { timeout: 8000 }),
+        8500,
+        `Warmup timed out for ${address}`,
+      );
+
+    if (device && device.isConnected()) {
+      activeConnections.set(address, device);
+      writeLog('INFO', `[WARMUP] ${address} pooled successfully.`);
+    } else {
+      writeLog(
+        'WARN',
+        `[WARMUP] ${address} connected but isConnected() returned false.`,
+      );
+    }
+  } catch (err: unknown) {
+    writeLog('WARN', `[WARMUP] ${address} failed: ${String(err)}`);
   }
 };

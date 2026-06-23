@@ -43,14 +43,16 @@ export const updateJournalTicketStatus = async (
 
     await RNFS.writeFile(FILE_PATH, JSON.stringify(updated), 'utf8');
 
-    forceServerStatusUpdate(orderId, status).catch((err: unknown) => {
-      writeLog(
-        'ERROR',
-        `[NETWORK-FATAL] Pipeline drop for ${orderId}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    });
+    if (status === 'COMPLETED') {
+      forceServerStatusUpdate(orderId, status).catch((err: unknown) => {
+        writeLog(
+          'ERROR',
+          `[NETWORK-FATAL] Pipeline drop for ${orderId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
+    }
 
     return updated;
   } catch (error: unknown) {
