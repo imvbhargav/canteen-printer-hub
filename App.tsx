@@ -973,7 +973,6 @@ export default function App(): React.JSX.Element {
       return;
     }
 
-    // ─── Verification code lifted out of the execution blocks ───
     let currentConfig = await getEngineConfig();
     if (!currentConfig) {
       try {
