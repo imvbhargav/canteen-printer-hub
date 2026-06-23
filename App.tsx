@@ -39,7 +39,13 @@ import {
 } from './utils/ticketStorage';
 import ReactNativeForegroundService from '@supersami/rn-foreground-service';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getEngineConfig, promptForEngineConfig } from './utils/engineConfig';
+import { getEngineConfig, EngineConfig } from './utils/engineConfig';
+import {
+  cacheDiscoveredPrinters,
+  getCachedDiscoveredPrinters,
+  headlessPrintingLocks,
+  updatePersistedEngineStatus,
+} from './utils/engineState';
 
 if (
   Platform.OS === 'android' &&
@@ -60,6 +66,13 @@ interface EngineStatus {
   connected: boolean;
   channels: string[];
   updatedAt: string;
+}
+
+declare global {
+  var engineHeartbeatInterval:
+    | ReturnType<typeof setInterval>
+    | null
+    | undefined;
 }
 
 const theme = {
@@ -590,7 +603,6 @@ const TicketCard = ({
     bg: theme.surfaceAlt,
   };
 
-  // Calculate if the 10-minute retry window is still valid
   const orderTime = item.createdAt ? new Date(item.createdAt).getTime() : 0;
   const isRetryAllowed = Date.now() - orderTime < 10 * 60 * 1000;
 
@@ -617,7 +629,6 @@ const TicketCard = ({
           </View>
         ))}
       </View>
-      {/* Hide retry button entirely if order status is COMPLETED or if the 10-min window expired */}
       {item.status !== 'COMPLETED' && isRetryAllowed && (
         <TouchableOpacity style={ticketStyles.retryBtn} onPress={onRetry}>
           <Text style={ticketStyles.retryText}>↺ RETRY SYSTEM PRINT</Text>
@@ -722,9 +733,24 @@ export default function App(): React.JSX.Element {
     updatedAt: '',
   });
 
+  // ─── NEW: Engine Explicit Configuration Panel Trackers ───
+  const [showConfigModal, setShowConfigModal] = useState<boolean>(false);
+  const [inputEngineId, setInputEngineId] = useState<string>('');
+  const [inputPriority, setInputPriority] = useState<string>('1');
+
   const countersRef = useRef<CounterConfig[]>([]);
   const discoveredPrintersRef = useRef<DiscoveredPrinter[]>([]);
   const logsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Sync localized parameter storage footprints on initial frame mounting
+  useEffect(() => {
+    getEngineConfig().then(cfg => {
+      if (cfg) {
+        setInputEngineId(cfg.id);
+        setInputPriority(String(cfg.priority));
+      }
+    });
+  }, []);
 
   const syncJournalUI = useCallback(async (): Promise<void> => {
     const journalData: Ticket[] = await readJournalTickets();
@@ -824,7 +850,6 @@ export default function App(): React.JSX.Element {
   };
 
   const executePrint = useCallback(async (ticket: Ticket): Promise<void> => {
-    // Time-window guard
     const orderTime = ticket.createdAt
       ? new Date(ticket.createdAt).getTime()
       : 0;
@@ -858,7 +883,6 @@ export default function App(): React.JSX.Element {
       return;
     }
 
-    // Auto-Retry Matrix Execution Loop
     const MAX_ATTEMPTS = 3;
     let lastError: unknown = null;
 
@@ -882,7 +906,6 @@ export default function App(): React.JSX.Element {
           cachedPrinter,
         );
 
-        // Success: Mark complete and exit the execution ring cleanly
         await updateJournalTicketStatus(ticket.orderId, 'COMPLETED');
         DeviceEventEmitter.emit('JOURNAL_UPDATED');
         return;
@@ -895,14 +918,12 @@ export default function App(): React.JSX.Element {
           }": ${String(err)}`,
         );
 
-        // If we have remaining attempts, cool down the driver stack for 2 seconds before retrying
         if (attempt < MAX_ATTEMPTS) {
           await new Promise<void>(resolve => setTimeout(() => resolve(), 2000));
         }
       }
     }
 
-    // Exhausted Path: Executes only if all 3 attempts hit the catch block
     writeLog(
       'ERROR',
       `[PRINT-PIPELINE] All ${MAX_ATTEMPTS} print cycles exhausted for ${ticket.orderId}. Marking as failed.`,
@@ -940,47 +961,73 @@ export default function App(): React.JSX.Element {
   };
 
   const toggleServerRuntime = async (): Promise<void> => {
+    const nativePusher = Pusher.getInstance();
+
     if (isServerRunning) {
       try {
         writeLog('WARN', '[SYSTEM] Initiating full system teardown matrix...');
-        const nativePusher = Pusher.getInstance();
 
+        // 1. Fetch current subscriptions to perform a clean sweep unsubscribe
+        const statusMeta = await AsyncStorage.getItem('@printer_engine_status');
+        if (statusMeta) {
+          const parsedStatus = JSON.parse(statusMeta);
+          if (Array.isArray(parsedStatus.channels)) {
+            for (const channelName of parsedStatus.channels) {
+              writeLog(
+                'INFO',
+                `[PUSHER] Cleaning channel reference: unsubscribe(${channelName})`,
+              );
+              await nativePusher.unsubscribe({ channelName });
+            }
+          }
+        }
+
+        // 2. Disconnect only if currently connected or initializing
         writeLog(
           'INFO',
-          '[PUSHER] Disconnecting native transport layer directly...',
+          '[PUSHER] Terminating native socket instance safely...',
         );
         await nativePusher.disconnect();
-        writeLog(
-          'INFO',
-          '[PUSHER] Native socket transport disconnected completely.',
-        );
+        writeLog('INFO', '[SYSTEM] Socket transport dropped cleanly.');
       } catch (disconnectError: unknown) {
         writeLog(
           'ERROR',
-          `[PUSHER] Socket cleanup fault: ${String(disconnectError)}`,
+          `[PUSHER] Teardown lifecycle exception: ${String(disconnectError)}`,
+        );
+      } finally {
+        // 3. Clean up the loop interval and reset state completely
+        if (globalThis.engineHeartbeatInterval) {
+          clearInterval(globalThis.engineHeartbeatInterval);
+          globalThis.engineHeartbeatInterval = null;
+        }
+
+        ReactNativeForegroundService.remove_task('printerOrderPollingTask');
+        await ReactNativeForegroundService.stop();
+        await AsyncStorage.removeItem('@printer_engine_status');
+
+        // Notify UI layer via event emitter instead of raw state updates
+        DeviceEventEmitter.emit('ENGINE_STATUS_CHANGED', {
+          connected: false,
+          channels: [],
+          updatedAt: new Date().toLocaleTimeString(),
+        });
+        writeLog(
+          'WARN',
+          '[SYSTEM] Foreground printer server terminated safely.',
         );
       }
-
-      ReactNativeForegroundService.remove_task('printerOrderPollingTask');
-      await ReactNativeForegroundService.stop();
-      await AsyncStorage.removeItem('@printer_engine_status');
-      setIsServerRunning(false);
-      setEngineStatus({ connected: false, channels: [], updatedAt: '' });
-      writeLog(
-        'WARN',
-        '[SYSTEM] Foreground printer agent server paused manually.',
-      );
       return;
     }
 
-    let currentConfig = await getEngineConfig();
+    // Load configuration cleanly
+    const currentConfig = await getEngineConfig();
     if (!currentConfig) {
-      try {
-        currentConfig = await promptForEngineConfig();
-      } catch {
-        writeLog('WARN', '[SYSTEM] Engine initialization aborted by operator.');
-        return;
-      }
+      writeLog(
+        'WARN',
+        '[SYSTEM] Core parameters missing. Opening setup panel.',
+      );
+      setShowConfigModal(true);
+      return;
     }
     const verifiedConfig = currentConfig;
 
@@ -988,7 +1035,7 @@ export default function App(): React.JSX.Element {
     if (!hasNotifPermission) {
       writeLog(
         'WARN',
-        '[SYSTEM] POST_NOTIFICATIONS denied — foreground notification will not display.',
+        '[SYSTEM] POST_NOTIFICATIONS tracking permissions missing.',
       );
     }
 
@@ -996,8 +1043,7 @@ export default function App(): React.JSX.Element {
       await ReactNativeForegroundService.start({
         id: 9912,
         title: 'Printer Server Active',
-        message:
-          'Monitoring multi-counter queue lines in parallel background threads...',
+        message: `Instance Node: ${verifiedConfig.id}`,
         icon: 'ic_launcher',
         importance: 'high',
         vibration: false,
@@ -1010,10 +1056,7 @@ export default function App(): React.JSX.Element {
       ReactNativeForegroundService.add_task(
         async () => {
           try {
-            writeLog(
-              'INFO',
-              `[ENGINE] Synchronizing cluster token for node ${verifiedConfig.id}...`,
-            );
+            // ─── 1. CORE HARHARDENED CLUSTER PING ───
             const enginePingResponse = await fetch(
               'https://cm-bps.vercel.app/api/engine/ping',
               {
@@ -1029,21 +1072,21 @@ export default function App(): React.JSX.Element {
             if (!enginePingResponse.ok) {
               const pingErrResult = await enginePingResponse
                 .json()
-                .catch(() => ({ error: 'Unknown system clash' }));
-              writeLog(
-                'ERROR',
-                `[CLUSTER-CONFLICT] Assertion failed: ${pingErrResult.error}`,
-              );
+                .catch(() => ({ error: 'Cluster collision context.' }));
 
+              if (globalThis.engineHeartbeatInterval) {
+                clearInterval(globalThis.engineHeartbeatInterval);
+                globalThis.engineHeartbeatInterval = null;
+              }
               ReactNativeForegroundService.remove_task(
                 'printerOrderPollingTask',
               );
               await ReactNativeForegroundService.stop();
-              setIsServerRunning(false);
-              setEngineStatus({
+
+              DeviceEventEmitter.emit('ENGINE_STATUS_CHANGED', {
                 connected: false,
                 channels: [],
-                updatedAt: '',
+                updatedAt: new Date().toLocaleTimeString(),
               });
               Alert.alert(
                 'Cluster Preemption',
@@ -1052,89 +1095,97 @@ export default function App(): React.JSX.Element {
               return;
             }
 
-            writeLog('INFO', '[API] Resolving counter endpoint allocation...');
+            // ─── 2. RELIABLE BACKGROUND HEARTBEAT LOOP ───
+            const PING_INTERVAL_MS = 5 * 60 * 1000;
+            if (!globalThis.engineHeartbeatInterval) {
+              globalThis.engineHeartbeatInterval = setInterval(async () => {
+                try {
+                  const pingResponse = await fetch(
+                    'https://cm-bps.vercel.app/api/engine/ping',
+                    {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        engineId: verifiedConfig.id,
+                        priority: verifiedConfig.priority,
+                      }),
+                    },
+                  );
+
+                  if (!pingResponse.ok) {
+                    if (globalThis.engineHeartbeatInterval) {
+                      clearInterval(globalThis.engineHeartbeatInterval);
+                      globalThis.engineHeartbeatInterval = null;
+                    }
+                    ReactNativeForegroundService.remove_task(
+                      'printerOrderPollingTask',
+                    );
+                    await ReactNativeForegroundService.stop();
+                    DeviceEventEmitter.emit('ENGINE_STATUS_CHANGED', {
+                      connected: false,
+                      channels: [],
+                      updatedAt: new Date().toLocaleTimeString(),
+                    });
+                  }
+                } catch {
+                  // Network drop out guards handled contextually by the server timeout lifecycle
+                }
+              }, PING_INTERVAL_MS);
+            }
+
+            // ─── 3. FETCH CONFIGURATION MATRICES ───
             const response: Response = await fetch(
               'https://cm-bps.vercel.app/api/counters',
             );
             const result: any = await response.json();
 
-            if (!result || !result.success || !Array.isArray(result.data)) {
-              writeLog(
-                'ERROR',
-                '[API] Failed parsing downstream data config matrix.',
-              );
+            if (!result || !result.success || !Array.isArray(result.data))
               return;
-            }
-
             const activeCounters: CounterConfig[] =
               result.data as CounterConfig[];
 
-            writeLog(
-              'INFO',
-              '[WARMUP] Initiating eager hardware pooling phase...',
-            );
+            // Read printer array safely out of disk snapshot rather than hitting component thread refs
+            const safeDiscoveredPrinters = await getCachedDiscoveredPrinters();
+
             for (const counter of activeCounters) {
               if (
                 !counter.printerAddress ||
                 counter.printerType === 'NONE' ||
                 counter.printerType === 'LAN'
-              ) {
+              )
                 continue;
-              }
               await warmPrinterConnection(
                 counter.printerType as 'BT' | 'USB',
                 counter.printerAddress,
               );
             }
 
-            const nativePusher: Pusher = Pusher.getInstance();
-            const headlessPrintingLocks: Record<string, boolean> = {};
-
-            writeLog('INFO', '[PUSHER] Triggering remote cluster dial up...');
-            await nativePusher.connect();
+            const headlessPusher: Pusher = Pusher.getInstance();
+            await headlessPusher.connect();
 
             const currentChannels: Set<string> = new Set<string>(
               activeCounters.map((c: CounterConfig) => `counter-${c.id}`),
             );
 
-            await AsyncStorage.setItem(
-              '@printer_engine_status',
-              JSON.stringify({
-                connected: true,
-                channels: Array.from(currentChannels),
-                updatedAt: new Date().toLocaleTimeString(),
-              }),
-            );
+            const statusPayload = {
+              connected: true,
+              channels: Array.from(currentChannels),
+              updatedAt: new Date().toLocaleTimeString(),
+            };
+
+            await updatePersistedEngineStatus(statusPayload);
+            DeviceEventEmitter.emit('ENGINE_STATUS_CHANGED', statusPayload);
 
             for (const channelName of currentChannels) {
               try {
-                writeLog(
-                  'INFO',
-                  `[PUSHER] Executing subscribe() promise for: ${channelName}`,
-                );
-
-                await nativePusher.subscribe({
+                await headlessPusher.subscribe({
                   channelName,
-                  onSubscriptionSucceeded: () => {
-                    writeLog(
-                      'INFO',
-                      `[PUSHER] CALLBACK: Confirmed subscription for channel: ${channelName}`,
-                    );
-                  },
-                  onSubscriptionError: (message: string) => {
-                    writeLog(
-                      'ERROR',
-                      `[PUSHER] CALLBACK: Subscription denied for ${channelName}: ${message}`,
-                    );
-                  },
+                  onSubscriptionSucceeded: () => {},
+                  onSubscriptionError: () => {},
                   onEvent: async (event: PusherEvent) => {
                     if (event.eventName !== 'NEW_ORDER') return;
 
                     try {
-                      writeLog(
-                        'INFO',
-                        `[PAYLOAD] Received event tracking signature on channel ${channelName}`,
-                      );
                       const rawTicket: Ticket =
                         typeof event.data === 'string'
                           ? (JSON.parse(event.data) as Ticket)
@@ -1151,25 +1202,19 @@ export default function App(): React.JSX.Element {
                         currentJournal.some(
                           (t: Ticket) => t.orderId === actionableTicket.orderId,
                         )
-                      ) {
-                        writeLog(
-                          'WARN',
-                          `[JOURNAL] Deduplicated duplicate order packet hash: ${actionableTicket.orderId}`,
-                        );
+                      )
                         return;
-                      }
 
                       await appendJournalTicket(actionableTicket);
                       DeviceEventEmitter.emit('JOURNAL_UPDATED');
 
-                      const matchedCounter: CounterConfig | undefined =
-                        activeCounters.find(
-                          (c: CounterConfig) =>
-                            c.id === actionableTicket.counterId,
-                        );
-
+                      const matchedCounter = activeCounters.find(
+                        (c: CounterConfig) =>
+                          c.id === actionableTicket.counterId,
+                      );
                       if (!matchedCounter) return;
-                      const printerAddress: string | undefined =
+
+                      const printerAddress =
                         matchedCounter.printerAddress || undefined;
 
                       if (
@@ -1177,28 +1222,36 @@ export default function App(): React.JSX.Element {
                         matchedCounter.status === 'ACTIVE' &&
                         matchedCounter.printerType !== 'NONE'
                       ) {
-                        if (headlessPrintingLocks[printerAddress]) {
-                          let attempts: number = 0;
-                          while (
-                            headlessPrintingLocks[printerAddress] &&
-                            attempts < 10
-                          ) {
-                            await new Promise<void>((r: () => void) => {
-                              setTimeout(r, 1500);
-                            });
-                            attempts++;
-                          }
+                        // ─── BOUNDED AND PROTECTED CONCURRENCY LOCK ───
+                        let attempts = 0;
+                        let locked = false;
+                        while (
+                          headlessPrintingLocks[printerAddress] &&
+                          attempts < 10
+                        ) {
+                          locked = true;
+                          await new Promise<void>(r => setTimeout(r, 1500));
+                          attempts++;
+                        }
+
+                        // Guard: If the queue wait limits break or time out, drop to prevent execution races
+                        if (headlessPrintingLocks[printerAddress] && locked) {
+                          await updateJournalTicketStatus(
+                            actionableTicket.orderId,
+                            'CANCELLED',
+                          );
+                          DeviceEventEmitter.emit('JOURNAL_UPDATED');
+                          return;
                         }
 
                         try {
                           headlessPrintingLocks[printerAddress] = true;
 
-                          const matchedPrinterDevice:
-                            | DiscoveredPrinter
-                            | undefined = discoveredPrintersRef.current.find(
-                            (dp: DiscoveredPrinter) =>
-                              dp.address === printerAddress,
-                          );
+                          const matchedPrinterDevice =
+                            safeDiscoveredPrinters.find(
+                              (dp: DiscoveredPrinter) =>
+                                dp.address === printerAddress,
+                            );
 
                           await executePrintJob(
                             matchedCounter.printerType as 'LAN' | 'BT' | 'USB',
@@ -1211,13 +1264,7 @@ export default function App(): React.JSX.Element {
                             actionableTicket.orderId,
                             'COMPLETED',
                           );
-                        } catch (taskErr: unknown) {
-                          writeLog(
-                            'ERROR',
-                            `[HEADLESS-TASK] Execution crashed: ${String(
-                              taskErr,
-                            )}`,
-                          );
+                        } catch {
                           await updateJournalTicketStatus(
                             actionableTicket.orderId,
                             'CANCELLED',
@@ -1233,65 +1280,35 @@ export default function App(): React.JSX.Element {
                         );
                         DeviceEventEmitter.emit('JOURNAL_UPDATED');
                       }
-                    } catch (parseErr: unknown) {
-                      writeLog(
-                        'ERROR',
-                        `[HEADLESS-PAYLOAD] Serialization block failed: ${String(
-                          parseErr,
-                        )}`,
-                      );
-                    }
+                    } catch {}
                   },
                 });
-
-                writeLog(
-                  'INFO',
-                  `[PUSHER] subscribe() promise resolved for: ${channelName}`,
-                );
-              } catch (subKeyError: unknown) {
-                writeLog(
-                  'ERROR',
-                  `[PUSHER] Critical promise failure calling subscribe line for ${channelName}: ${String(
-                    subKeyError,
-                  )}`,
-                );
-              }
+              } catch {}
             }
-          } catch (netFatal: unknown) {
-            writeLog(
-              'ERROR',
-              `[HEADLESS-CORE] Task loop failed out completely: ${String(
-                netFatal,
-              )}`,
-            );
-            await AsyncStorage.setItem(
-              '@printer_engine_status',
-              JSON.stringify({
-                connected: false,
-                channels: [],
-                updatedAt: new Date().toLocaleTimeString(),
-              }),
-            );
+          } catch {
+            const fallbackPayload = {
+              connected: false,
+              channels: [],
+              updatedAt: new Date().toLocaleTimeString(),
+            };
+            await updatePersistedEngineStatus(fallbackPayload);
+            DeviceEventEmitter.emit('ENGINE_STATUS_CHANGED', fallbackPayload);
           }
         },
         {
           delay: 1000,
           onLoop: false,
           taskId: 'printerOrderPollingTask',
-          onError: (err: any) => {
-            writeLog(
-              'ERROR',
-              `[FOREGROUND-SERVICE] Task runner exception: ${String(err)}`,
-            );
-          },
+          onError: () => {},
         },
       );
 
       setIsServerRunning(true);
-      writeLog('INFO', '[SYSTEM] Foreground processing channel established.');
-    } catch (e: unknown) {
-      writeLog('ERROR', `[SYSTEM] Boot sequence error: ${String(e)}`);
-      Alert.alert('Fault', 'Could not secure background channel runtime.');
+    } catch {
+      Alert.alert(
+        'Fault',
+        'Could not establish foreground channel context execution layer.',
+      );
     }
   };
 
@@ -1444,6 +1461,7 @@ export default function App(): React.JSX.Element {
     setManualIp('');
   };
 
+  // Whenever hardware scanner state yields discovery updates, update memory blocks:
   const addDiscoveredPrinter = (device: DiscoveredPrinter): void => {
     setDiscoveredPrinters((prev: DiscoveredPrinter[]) => {
       if (prev.find((p: DiscoveredPrinter) => p.address === device.address)) {
@@ -1451,9 +1469,26 @@ export default function App(): React.JSX.Element {
       }
       const next: DiscoveredPrinter[] = [...prev, device];
       discoveredPrintersRef.current = next;
+
+      // Cache it down to AsyncStorage for the background context to read typesafely
+      cacheDiscoveredPrinters(next);
       return next;
     });
   };
+
+  useEffect(() => {
+    const statusSub = DeviceEventEmitter.addListener(
+      'ENGINE_STATUS_CHANGED',
+      (status: EngineStatus) => {
+        setEngineStatus(status);
+        setIsServerRunning(status.connected);
+      },
+    );
+
+    return () => {
+      statusSub.remove();
+    };
+  }, []);
 
   useEffect(() => {
     let stopBtScanning: (() => void) | null = null;
@@ -1627,6 +1662,15 @@ export default function App(): React.JSX.Element {
                 {isServerRunning ? 'ON' : 'OFF'}
               </Text>
             </View>
+          </TouchableOpacity>
+
+          {/* Settings Trigger Icon Gear wheel */}
+          <TouchableOpacity
+            style={uiStyles.configHeaderBtn}
+            onPress={() => setShowConfigModal(true)}
+            disabled={isServerRunning}
+          >
+            <Text style={uiStyles.configHeaderBtnText}>⚙</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -1968,7 +2012,7 @@ export default function App(): React.JSX.Element {
                           {log.level}
                         </Text>
                       </View>
-                      <View style={timeWrapStyle.timeWrap}>
+                      <View style={appStyles.timeWrap}>
                         <Text style={appStyles.logTs}>
                           🕒 {new Date(log.timestamp).toLocaleTimeString()}
                         </Text>
@@ -2077,15 +2121,205 @@ export default function App(): React.JSX.Element {
           </Text>
         </TouchableOpacity>
       </View>
+
+      {/* ─── ENGINE MANUAL RE-CONFIGURATION SHEETS MODAL ─── */}
+      {showConfigModal && (
+        <View style={uiStyles.modalOverlay}>
+          <View style={uiStyles.modalContainer}>
+            <View style={uiStyles.modalHeader}>
+              <Text style={uiStyles.modalTitle}>
+                Engine Cluster Configuration
+              </Text>
+              <TouchableOpacity
+                onPress={() => setShowConfigModal(false)}
+                style={uiStyles.modalCloseBtn}
+              >
+                <Text style={uiStyles.modalCloseBtnText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            <View style={uiStyles.modalBody}>
+              <Text style={uiStyles.helperText}>
+                Define persistent identifiers for this tablet instance. Active
+                assignments handle downstream channel feeds across your network
+                counters.
+              </Text>
+
+              <View style={uiStyles.inputGroup}>
+                <Text style={uiStyles.inputLabel}>
+                  PERSISTENT NODE INSTANCE ID
+                </Text>
+                <TextInput
+                  style={uiStyles.textInput}
+                  value={inputEngineId}
+                  onChangeText={setInputEngineId}
+                  placeholder="e.g., Engine-Cafeteria-Tab1"
+                  placeholderTextColor={theme.muted}
+                  autoCapitalize="none"
+                />
+              </View>
+
+              <View style={uiStyles.inputGroup}>
+                <Text style={uiStyles.inputLabel}>
+                  CLUSTER PRIORITY WEIGHTING
+                </Text>
+                <TextInput
+                  style={uiStyles.textInput}
+                  value={inputPriority}
+                  onChangeText={input =>
+                    setInputPriority(input.replace(/[^0-9]/g, ''))
+                  }
+                  placeholder="1 (Low) or 2 (High)"
+                  placeholderTextColor={theme.muted}
+                  keyboardType="numeric"
+                />
+              </View>
+
+              <TouchableOpacity
+                style={uiStyles.saveConfigBtn}
+                onPress={async () => {
+                  if (!inputEngineId.trim()) {
+                    Alert.alert(
+                      'Validation Error',
+                      'Engine target ID metric cannot be left empty.',
+                    );
+                    return;
+                  }
+                  const calculatedPriority = parseInt(inputPriority, 10) || 1;
+                  const targetConfig: EngineConfig = {
+                    id: inputEngineId.trim(),
+                    priority: calculatedPriority,
+                  };
+
+                  await AsyncStorage.setItem(
+                    '@munchup_engine_config',
+                    JSON.stringify(targetConfig),
+                  );
+                  setShowConfigModal(false);
+                  writeLog(
+                    'INFO',
+                    `[CONFIG] Engine parameters manually updated locally to: ${targetConfig.id} [P: ${targetConfig.priority}]`,
+                  );
+                }}
+              >
+                <Text style={uiStyles.saveConfigBtnText}>
+                  COMMIT ENGINE CONFIG
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
 
-const timeWrapStyle = StyleSheet.create({
-  timeWrap: { flexDirection: 'row', alignItems: 'center' },
+const uiStyles = StyleSheet.create({
+  configHeaderBtn: {
+    display: 'none',
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: theme.border,
+    backgroundColor: theme.surfaceAlt,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 8,
+  },
+  configHeaderBtnText: {
+    fontSize: 16,
+    color: theme.secondary,
+  },
+  modalOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(15, 23, 42, 0.4)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+    zIndex: 999,
+  },
+  modalContainer: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: theme.surface,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: theme.border,
+    overflow: 'hidden',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    backgroundColor: theme.surfaceAlt,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.borderLight,
+  },
+  modalTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: theme.foreground,
+    letterSpacing: 0.2,
+  },
+  modalCloseBtn: {
+    padding: 4,
+  },
+  modalCloseBtnText: {
+    fontSize: 14,
+    color: theme.muted,
+  },
+  modalBody: {
+    padding: 16,
+    gap: 16,
+  },
+  helperText: {
+    fontSize: 11,
+    color: theme.muted,
+    lineHeight: 16,
+  },
+  inputGroup: {
+    gap: 6,
+  },
+  inputLabel: {
+    fontFamily: Platform.OS === 'android' ? 'monospace' : 'Courier New',
+    fontSize: 10,
+    color: theme.secondary,
+    fontWeight: '700',
+  },
+  textInput: {
+    backgroundColor: theme.surface,
+    color: theme.foreground,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 8,
+    fontSize: 13,
+    borderWidth: 1,
+    borderColor: theme.border,
+  },
+  saveConfigBtn: {
+    backgroundColor: theme.accent,
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  saveConfigBtnText: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    fontSize: 12,
+    letterSpacing: 0.5,
+  },
 });
 
 const appStyles = StyleSheet.create({
+  timeWrap: { flexDirection: 'row', alignItems: 'center' },
   container: { flex: 1, backgroundColor: theme.background },
   flexContainer: { flex: 1 },
   header: {
