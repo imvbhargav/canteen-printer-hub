@@ -885,7 +885,6 @@ export default function App(): React.JSX.Element {
         writeLog('WARN', '[SYSTEM] Initiating full system teardown matrix...');
         const nativePusher = Pusher.getInstance();
 
-        // Let the SDK native driver clean up subscriptions through socket termination
         writeLog(
           'INFO',
           '[PUSHER] Disconnecting native transport layer directly...',
@@ -958,30 +957,6 @@ export default function App(): React.JSX.Element {
               result.data as CounterConfig[];
             const nativePusher: Pusher = Pusher.getInstance();
             const headlessPrintingLocks: Record<string, boolean> = {};
-
-            writeLog(
-              'INFO',
-              '[PUSHER] Configuring native driver system variables...',
-            );
-            await nativePusher.init({
-              apiKey: 'de978c89a0a60f82aefd',
-              cluster: 'ap2',
-              onConnectionStateChange: (
-                currentState: string,
-                previousState: string,
-              ) => {
-                writeLog(
-                  'INFO',
-                  `[PUSHER] State change event: ${previousState} -> ${currentState}`,
-                );
-              },
-              onError: (message: string, code) => {
-                writeLog(
-                  'ERROR',
-                  `[PUSHER-DRV] Internal transport failure [${code}]: ${message}`,
-                );
-              },
-            });
 
             writeLog('INFO', '[PUSHER] Triggering remote cluster dial up...');
             await nativePusher.connect();
@@ -1367,7 +1342,54 @@ export default function App(): React.JSX.Element {
 
     const initPipeline = async (): Promise<void> => {
       writeLog('INFO', '=== SYSTEM BOOT SEQUENCE START ===');
+
+      // HARD DEFENSIVE TEARDOWN: Clean up remnants of killed app states
+      try {
+        writeLog(
+          'WARN',
+          '[BOOT-CLEANUP] Purging orphaned native service task locks...',
+        );
+        ReactNativeForegroundService.remove_task('printerOrderPollingTask');
+        await ReactNativeForegroundService.stop();
+        await AsyncStorage.removeItem('@printer_engine_status');
+        setIsServerRunning(false);
+      } catch {}
+
       await clearStaleJournalTickets();
+
+      // Initialize Pusher exactly once per application instance lifetime
+      try {
+        const nativePusher = Pusher.getInstance();
+        await nativePusher.init({
+          apiKey: 'de978c89a0a60f82aefd',
+          cluster: 'ap2',
+          onConnectionStateChange: (
+            currentState: string,
+            previousState: string,
+          ) => {
+            writeLog(
+              'INFO',
+              `[PUSHER] State change event: ${previousState} -> ${currentState}`,
+            );
+          },
+          onError: (message: string, code: any) => {
+            writeLog(
+              'ERROR',
+              `[PUSHER-DRV] Internal transport failure [${code}]: ${message}`,
+            );
+          },
+        });
+        writeLog(
+          'INFO',
+          '[PUSHER] Global native driver parameters initialized successfully.',
+        );
+      } catch (pusherInitErr: unknown) {
+        writeLog(
+          'ERROR',
+          `[PUSHER] Static configuration lock failed: ${String(pusherInitErr)}`,
+        );
+      }
+
       setScanPhase('bonded');
       const btPermission: boolean = await requestBluetoothPermissions();
 
