@@ -1,5 +1,5 @@
 import RNFS from 'react-native-fs';
-import { Ticket } from '../types';
+import { Ticket, TicketStatus } from '../types';
 import { writeLog } from './logger';
 
 const FILE_PATH = `${RNFS.DocumentDirectoryPath}/tickets_journal.json`;
@@ -33,7 +33,7 @@ export const appendJournalTicket = async (
 
 export const updateJournalTicketStatus = async (
   orderId: string,
-  status: 'PENDING' | 'COMPLETED' | 'CANCELLED',
+  status: TicketStatus,
 ): Promise<Ticket[]> => {
   try {
     const history = await readJournalTickets();
@@ -43,64 +43,77 @@ export const updateJournalTicketStatus = async (
 
     await RNFS.writeFile(FILE_PATH, JSON.stringify(updated), 'utf8');
 
-    if (status === 'COMPLETED') {
-      forceServerStatusUpdate(orderId, status).catch((err: unknown) => {
-        writeLog(
-          'ERROR',
-          `[NETWORK-FATAL] Pipeline drop for ${orderId}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      });
+    // CRITICAL: We await this synchronously now so failures halt the print pipeline
+    if (['PENDING', 'COMPLETED', 'PRINTING'].includes(status)) {
+      await forceServerStatusUpdateWithRetry(orderId, status);
     }
 
     return updated;
   } catch (error: unknown) {
     writeLog(
       'ERROR',
-      `[JOURNAL] Critical failure while saving status: ${
+      `[JOURNAL-CRITICAL] Failure during status processing: ${
         error instanceof Error ? error.message : 'Unknown'
       }`,
     );
-    return [];
+    throw error; // Bubble up to stop execution
   }
 };
 
-const forceServerStatusUpdate = async (
+const forceServerStatusUpdateWithRetry = async (
   orderId: string,
-  status: 'PENDING' | 'COMPLETED' | 'CANCELLED',
+  status: TicketStatus,
 ): Promise<void> => {
   const API_URL = `https://cm-bps.vercel.app/api/tickets/${orderId}/status`;
 
-  // Safe math-based string generation that will never throw in a headless task
-  const requestId = `REQ-${Date.now()}-${Math.random()
-    .toString(36)
-    .substring(2, 9)}`;
-
-  try {
-    const response: Response = await fetch(API_URL, {
+  await fetchWithBackoff(() =>
+    fetch(API_URL, {
       method: 'PATCH',
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        'X-Request-Id': requestId,
+        'X-Engine-Token':
+          '38d6960a32cda66ce327d44d358755f706420303e11825a34eca38544a07e2c7',
       },
       body: JSON.stringify({ status }),
-    });
+    }),
+  );
+};
 
-    if (!response.ok) {
-      const fallbackText = await response.text();
-      throw new Error(`HTTP ${response.status}: ${fallbackText}`);
+export const fetchWithBackoff = async (
+  task: () => Promise<Response>,
+  maxAttempts = 5,
+  baseDelayMs = 2000,
+): Promise<Response> => {
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await task();
+      if (response.ok) {
+        return response; // Success breaker
+      }
+
+      const text = await response.text().catch(() => 'No body context');
+      throw new Error(`HTTP ${response.status}: ${text}`);
+    } catch (error) {
+      lastError = error;
+      writeLog(
+        'WARN',
+        `[NETWORK-RETRY] Attempt ${attempt}/${maxAttempts} failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+
+      if (attempt < maxAttempts) {
+        // Safe linear-exponential delay tracking: 2s, 4s, 8s, 16s...
+        const delay = baseDelayMs * Math.pow(2, attempt - 1);
+        await new Promise<void>(resolve => setTimeout(() => resolve(), delay));
+      }
     }
-  } catch (networkError: unknown) {
-    throw new Error(
-      `Socket transport exception: ${
-        networkError instanceof Error
-          ? networkError.message
-          : String(networkError)
-      }`,
-    );
   }
+
+  throw lastError;
 };
 
 export const clearStaleJournalTickets = async (): Promise<Ticket[]> => {
@@ -140,6 +153,184 @@ export const clearStaleJournalTickets = async (): Promise<Ticket[]> => {
     await RNFS.writeFile(FILE_PATH, JSON.stringify(updated), 'utf8');
     return updated;
   } catch {
+    return [];
+  }
+};
+
+/**
+ * Deduplicates and merges arrays of tickets by orderId, updating statuses based on
+ * server final states and handling the 10-minute retry expiration window.
+ */
+export const mergeJournalTickets = async (
+  fetchedTickets: Ticket[],
+): Promise<Ticket[]> => {
+  try {
+    const history = await readJournalTickets();
+    const updatedHistory = [...history];
+    const TEN_MINUTES_MS = 10 * 60 * 1000;
+    const nowMs = Date.now();
+
+    for (const fetched of fetchedTickets) {
+      const existingIndex = updatedHistory.findIndex(
+        (t: Ticket) => t.orderId === fetched.orderId,
+      );
+
+      // FIX: Fallback to current time or Unix epoch if createdAt is undefined
+      const ticketCreatedAtMs = new Date(fetched.createdAt ?? nowMs).getTime();
+      const isExpired = nowMs - ticketCreatedAtMs > TEN_MINUTES_MS;
+
+      // FIX: Fallback to 'PENDING' if status is undefined
+      const serverStatus: TicketStatus = fetched.status ?? 'PENDING';
+      let targetStatus: TicketStatus = serverStatus;
+
+      if (['PENDING', 'PRINTING'].includes(serverStatus) && isExpired) {
+        // Exceeded 10 mins. Server CANNOT retry anymore.
+        // In-app we switch it to 'CANCELLED' so the client UI allows manual user retry action.
+        targetStatus = 'CANCELLED';
+      }
+
+      if (existingIndex === -1) {
+        // Completely new ticket from server sync
+        updatedHistory.unshift({
+          ...fetched,
+          status: targetStatus,
+        });
+      } else {
+        const localTicket = updatedHistory[existingIndex];
+
+        // SERVER FINAL OVERRIDE RULE:
+        // If server is terminal (COMPLETED/CANCELLED), or local state is active but server changed, overwrite it.
+        if (
+          ['COMPLETED', 'CANCELLED'].includes(serverStatus) ||
+          localTicket.status !== targetStatus
+        ) {
+          updatedHistory[existingIndex] = {
+            ...localTicket,
+            ...fetched,
+            status: targetStatus,
+          };
+        }
+      }
+    }
+
+    // Sort descending so newest entries always sit cleanly at the top of the journal view
+    // FIX: Fallback comparison variables to 0 to eliminate string | undefined errors
+    updatedHistory.sort(
+      (a, b) =>
+        new Date(b.createdAt ?? 0).getTime() -
+        new Date(a.createdAt ?? 0).getTime(),
+    );
+
+    await RNFS.writeFile(FILE_PATH, JSON.stringify(updatedHistory), 'utf8');
+    return updatedHistory;
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * Parses sequential IDs to find numerical missing counter items safely.
+ * e.g., '260621A0009' and '260621A0012' returns ['260621A0010', '260621A0011']
+ */
+const calculateMissingSequences = (
+  oldestId: string,
+  newestId: string,
+): string[] => {
+  const missing: string[] = [];
+
+  // Extract alphanumeric suffix components: e.g. "260621A" and "0009"
+  const matchOld = oldestId.match(/^([A-Z0-9]+[A-Z])(\d+)$/i);
+  const matchNew = newestId.match(/^([A-Z0-9]+[A-Z])(\d+)$/i);
+
+  if (!matchOld || !matchNew) return [];
+
+  const [_, prefixOld, numStrOld] = matchOld;
+  const [__, prefixNew, numStrNew] = matchNew;
+
+  // Prefix must match exactly (same counter sequence group/date signature)
+  if (prefixOld !== prefixNew) return [];
+
+  const startNum = parseInt(numStrOld, 10);
+  const endNum = parseInt(numStrNew, 10);
+  const padLength = numStrOld.length;
+
+  for (let i = startNum + 1; i < endNum; i++) {
+    const nextNumStr = String(i).padStart(padLength, '0');
+    missing.push(`${prefixOld}${nextNumStr}`);
+  }
+
+  return missing;
+};
+
+/**
+ * Main engine synchronization macro. Orchestrates network queries to prevent dropped packets.
+ */
+export const reconcileMissingJournalTickets = async (): Promise<Ticket[]> => {
+  try {
+    const history = await readJournalTickets();
+
+    let lastSeenOrderId: string | null = null;
+    let missingOrderIds: string[] = [];
+
+    if (history.length > 0) {
+      // Sort oldest to newest locally to map exact continuous boundaries safely
+      const chronological = [...history].sort(
+        (a, b) =>
+          new Date(a.createdAt || 0).getTime() -
+          new Date(b.createdAt || 0).getTime(),
+      );
+
+      lastSeenOrderId = chronological[chronological.length - 1].orderId;
+
+      // Scan consecutive blocks for structural omissions
+      for (let i = 0; i < chronological.length - 1; i++) {
+        const gapSlots = calculateMissingSequences(
+          chronological[i].orderId,
+          chronological[i + 1].orderId,
+        );
+        missingOrderIds = [...missingOrderIds, ...gapSlots];
+      }
+    }
+
+    writeLog(
+      'INFO',
+      `[RECONCILE] Checking server pipeline. Gaps calculated: ${missingOrderIds.length}`,
+    );
+
+    const syncResponse = await fetchWithBackoff(() =>
+      fetch('https://cm-bps.vercel.app/api/engine/sync', {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'X-Engine-Token':
+            '38d6960a32cda66ce327d44d358755f706420303e11825a34eca38544a07e2c7',
+        },
+        body: JSON.stringify({
+          lastSeenOrderId,
+          missingOrderIds,
+        }),
+      }),
+    );
+
+    const jsonResult = await syncResponse.json();
+    if (jsonResult.success && Array.isArray(jsonResult.data)) {
+      writeLog(
+        'INFO',
+        `[RECONCILE] Recovered ${jsonResult.data.length} tickets securely from back-channel endpoints.`,
+      );
+      const updatedList = await mergeJournalTickets(jsonResult.data);
+      return updatedList;
+    }
+
+    return history;
+  } catch (error) {
+    writeLog(
+      'ERROR',
+      `[RECONCILE-FATAL] Failed to catch up missing transactions: ${String(
+        error,
+      )}`,
+    );
     return [];
   }
 };

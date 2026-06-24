@@ -5,6 +5,13 @@ export interface TicketItem {
   itemTotal: string;
 }
 
+export type TicketStatus =
+  | 'PENDING'
+  | 'PRINTING'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'CANCELLED';
+
 export interface Ticket {
   orderId: string;
   counterId: string;
@@ -12,7 +19,7 @@ export interface Ticket {
   netTotal: string;
   items: TicketItem[];
   createdAt: string;
-  status?: 'PENDING' | 'READY' | 'COMPLETED' | 'CANCELLED';
+  status?: TicketStatus;
 }
 
 export interface CounterConfig {

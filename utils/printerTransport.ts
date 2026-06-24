@@ -4,7 +4,6 @@ import {
   ThermalPrinterDevice,
 } from 'react-native-thermal-pos-printer';
 import { writeLog } from './logger';
-import { DiscoveredPrinter } from './printerDiscovery';
 import net from 'react-native-tcp-socket';
 import { Ticket } from '../types';
 import { generateReceiptBytes, formatPrice } from './printerUtils';
@@ -97,93 +96,54 @@ const sendLAN = (address: string, bytes: Uint8Array): Promise<void> => {
 const resolveConnectedDevice = async (
   type: 'BT' | 'USB',
   address: string,
-  discovered?: DiscoveredPrinter,
 ): Promise<ThermalPrinterDevice> => {
-  let device: ThermalPrinterDevice | undefined = activeConnections.get(address);
-  let needsStabilization: boolean = false;
+  let device = activeConnections.get(address);
 
+  // 1. Check existing pool
+  if (device?.isConnected()) {
+    writeLog('INFO', `[${type}] Reusing warm connection to ${address}.`);
+    return device;
+  }
+
+  // 2. Pool miss or silently dead socket — evict it
   if (device) {
-    if (device.isConnected()) {
-      writeLog(
-        'INFO',
-        `[${type}] Reusing warm connection to ${address}. Instant print.`,
-      );
-      return device;
-    } else {
-      writeLog(
-        'WARN',
-        `[${type}] Cached socket is dead. Evicting from pool...`,
-      );
-      activeConnections.delete(address);
-      device = undefined;
-    }
-  }
-
-  if (!device && discovered?._device) {
     writeLog(
-      'INFO',
-      `[${type}] Using fresh instance from scanner. Connecting...`,
+      'WARN',
+      `[${type}] Dead cached socket detected. Evicting from pool.`,
     );
-    device = discovered._device;
+    activeConnections.delete(address);
   }
 
-  if (!device) {
-    writeLog(
-      'INFO',
-      `[${type}] Cold start route triggered. Mounting driver channel: ${address}`,
-    );
-    device = await withTimeout<ThermalPrinterDevice>(
-      ReactNativePosPrinter.connectPrinter(address, { timeout: 8000 }),
-      8500,
-      `Static connection wrapper allocation to ${address} timed out or deadlocked.`,
-    );
-    needsStabilization = true;
-  }
-
-  if (!device) {
-    throw new Error(
-      `[${type}] Could not resolve device instance reference allocations for ${address}`,
-    );
-  }
+  // 3. Headless-Safe Cold Start: Always allocate fresh
+  writeLog('INFO', `[${type}] Cold connecting to ${address}...`);
+  device = await withTimeout<ThermalPrinterDevice>(
+    ReactNativePosPrinter.connectPrinter(address, { timeout: 8000 }),
+    8500,
+    `Hardware allocation to ${address} timed out.`,
+  );
 
   if (!device.isConnected()) {
     writeLog(
-      'INFO',
-      `[${type}] Direct pipe link closed. Forcing connection thread descriptor...`,
+      'WARN',
+      `[${type}] Allocation succeeded but port unready. Forcing connection layer...`,
     );
     await withTimeout<void>(
       device.connect({ timeout: 8000 }),
       8500,
-      `Instance connection step to ${address} timed out or deadlocked.`,
+      `Connect layer timed out`,
     );
-    needsStabilization = true;
   }
 
-  if (needsStabilization) {
-    writeLog(
-      'INFO',
-      `[${type}] Hardware socket opening... stabilizing channel for 2s.`,
-    );
-    await sleep(2000);
-
-    if (!device.isConnected()) {
-      writeLog(
-        'WARN',
-        `[${type}] Target port unready after baseline sleep. Forcing step-down connection retry cycle...`,
-      );
-      await withTimeout<void>(
-        device.connect({ timeout: 8000 }),
-        8500,
-        'Fallback hardware retry descriptor timed out',
-      );
-      await sleep(1000);
-    }
-  }
+  // 4. Hardware Stabilization
+  await sleep(2000);
 
   if (!device.isConnected()) {
-    throw new Error(`[${type}] Connection rejected by printer hardware.`);
+    throw new Error(
+      `[${type}] Connection rejected by printer hardware after stabilization.`,
+    );
   }
 
+  // 5. Cache for future jobs and the 2-minute heartbeat
   activeConnections.set(address, device);
   return device;
 };
@@ -192,13 +152,11 @@ const sendViaDeviceNative = async (
   type: 'BT' | 'USB',
   address: string,
   ticket: Ticket,
-  discovered?: DiscoveredPrinter,
   paperWidth: number = 48,
 ): Promise<void> => {
   const device: ThermalPrinterDevice = await resolveConnectedDevice(
     type,
     address,
-    discovered,
   );
 
   try {
@@ -207,26 +165,33 @@ const sendViaDeviceNative = async (
     const underlineSeparator: string = '_'.repeat(paperWidth);
     const dashSeparator: string = '-'.repeat(paperWidth);
 
+    // Header block synchronized with matching typography cases
     await device.printText('BMSCW CANTEEN\n', { align: 'CENTER', bold: true });
     await device.printText('Basavanagudi\n', { align: 'CENTER' });
     await device.printText('+91 77607 62484\n', { align: 'CENTER' });
-    await device.printText(`${underlineSeparator}\n`, { align: 'LEFT' });
+    await device.printText(`${underlineSeparator}\n`, { align: 'CENTER' }); // Matches generateReceiptBytes formatting line string
 
-    const timestamp: Date = new Date();
+    const timestamp: Date = ticket.createdAt
+      ? new Date(ticket.createdAt)
+      : new Date();
     const dateStr: string = timestamp.toLocaleDateString('en-GB');
     const timeStr: string = timestamp.toLocaleTimeString('en-US', {
       hour: '2-digit',
       minute: '2-digit',
       hour12: true,
     });
-    await device.printText(`D : ${dateStr} T : ${timeStr}\n\n`, {
-      align: 'LEFT',
+    // Center aligned timestamp line
+    await device.printText(`Date: ${dateStr}   Time: ${timeStr}\n\n`, {
+      align: 'CENTER',
     });
 
     const tokenNo: string = ticket.ticketReference || 'XXXX';
-    await device.printText(`Order No / Token No : ${tokenNo}\n`, {
-      align: 'LEFT',
+    // Emphasized Token Number block with padding feeds matching the ESC/POS layout
+    await device.printText(`TOKEN: ${tokenNo}\n\n`, {
+      align: 'CENTER',
+      bold: true,
     });
+
     await device.printText(`${dashSeparator}\n`, { align: 'LEFT' });
 
     const amtColWidth: number = 8;
@@ -260,10 +225,16 @@ const sendViaDeviceNative = async (
       });
     }
 
-    const totalLabel: string = 'TOTAL'.padEnd(paperWidth - 10, ' ');
+    // Dynamic right total string computation matching generateReceiptBytes string padding rules
     const rawNetTotal: string = ticket.netTotal || '0.00';
-    const totalAmountFormatted: string = `\u20B9${formatPrice(rawNetTotal)}`;
-    const totalValRight: string = totalAmountFormatted.padStart(10, ' ');
+    const totalAmountFormatted: string = `Rs.${formatPrice(rawNetTotal)}`; // Replaced Unicode sign with matching Rs. string format
+
+    const totalLabelWidth: number = paperWidth - amtColWidth;
+    const totalLabel: string = 'TOTAL'.padEnd(totalLabelWidth, ' ');
+    const totalValRight: string = totalAmountFormatted.padStart(
+      amtColWidth,
+      ' ',
+    );
 
     await device.printText(`${dashSeparator}\n`, { align: 'LEFT' });
     await device.printText(`${totalLabel}${totalValRight}\n`, {
@@ -290,7 +261,6 @@ export const executePrintJob = async (
   type: 'LAN' | 'BT' | 'USB',
   address: string,
   ticket: Ticket,
-  discovered?: DiscoveredPrinter,
 ): Promise<void> => {
   writeLog('INFO', `[TRANSPORT] Routing job → ${type}[${address}]`);
 
@@ -300,7 +270,7 @@ export const executePrintJob = async (
       return sendLAN(address, bytes);
     case 'BT':
     case 'USB':
-      return sendViaDeviceNative(type, address, ticket, discovered, 48);
+      return sendViaDeviceNative(type, address, ticket, 48);
     default:
       throw new Error(`[TRANSPORT] Unknown printer type: ${type}`);
   }
@@ -311,6 +281,18 @@ export const warmPrinterConnection = async (
   address: string,
 ): Promise<void> => {
   try {
+    const existing: ThermalPrinterDevice | undefined =
+      activeConnections.get(address);
+    if (existing?.isConnected()) {
+      writeLog('INFO', `[WARMUP] ${address} already warm. Skipping.`);
+      return;
+    }
+
+    if (existing) {
+      writeLog('WARN', `[WARMUP] Evicting dead cached socket for ${address}.`);
+      activeConnections.delete(address);
+    }
+
     writeLog('INFO', `[WARMUP] Pre-connecting ${type}[${address}]`);
 
     const device: ThermalPrinterDevice =
@@ -320,13 +302,22 @@ export const warmPrinterConnection = async (
         `Warmup timed out for ${address}`,
       );
 
-    if (device && device.isConnected()) {
+    if (!device.isConnected()) {
+      await withTimeout<void>(
+        device.connect({ timeout: 8000 }),
+        8500,
+        `Warmup connect layer timed out`,
+      );
+      await sleep(2000);
+    }
+
+    if (device.isConnected()) {
       activeConnections.set(address, device);
       writeLog('INFO', `[WARMUP] ${address} pooled successfully.`);
     } else {
       writeLog(
         'WARN',
-        `[WARMUP] ${address} connected but isConnected() returned false.`,
+        `[WARMUP] ${address} still not connected after warmup attempt.`,
       );
     }
   } catch (err: unknown) {

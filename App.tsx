@@ -36,13 +36,13 @@ import {
   updateJournalTicketStatus,
   clearStaleJournalTickets,
   appendJournalTicket,
+  reconcileMissingJournalTickets,
 } from './utils/ticketStorage';
 import ReactNativeForegroundService from '@supersami/rn-foreground-service';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getEngineConfig, EngineConfig } from './utils/engineConfig';
 import {
   cacheDiscoveredPrinters,
-  getCachedDiscoveredPrinters,
   headlessPrintingLocks,
   updatePersistedEngineStatus,
 } from './utils/engineState';
@@ -66,13 +66,6 @@ interface EngineStatus {
   connected: boolean;
   channels: string[];
   updatedAt: string;
-}
-
-declare global {
-  var engineHeartbeatInterval:
-    | ReturnType<typeof setInterval>
-    | null
-    | undefined;
 }
 
 const theme = {
@@ -834,18 +827,12 @@ export default function App(): React.JSX.Element {
     type: string,
     address: string,
     ticket: Ticket,
-    discovered?: DiscoveredPrinter,
   ): Promise<void> => {
     writeLog(
       'INFO',
       `[PRINT] Initiating print to ${type}[${address}] — Ref: ${ticket.ticketReference}`,
     );
-    await executePrintJob(
-      type as 'LAN' | 'BT' | 'USB',
-      address,
-      ticket,
-      discovered,
-    );
+    await executePrintJob(type as 'LAN' | 'BT' | 'USB', address, ticket);
     writeLog('INFO', `[PRINT] Print successful → ${type}[${address}]`);
   };
 
@@ -893,17 +880,10 @@ export default function App(): React.JSX.Element {
           `[PRINT-PIPELINE] Dispatching print job for ${ticket.orderId} (Attempt ${attempt}/${MAX_ATTEMPTS})`,
         );
 
-        const cachedPrinter: DiscoveredPrinter | undefined =
-          discoveredPrintersRef.current.find(
-            (dp: DiscoveredPrinter) =>
-              dp.address === targetCounter.printerAddress,
-          );
-
         await runHardwarePrint(
           targetCounter.printerType,
           targetCounter.printerAddress,
           ticket,
-          cachedPrinter,
         );
 
         await updateJournalTicketStatus(ticket.orderId, 'COMPLETED');
@@ -967,7 +947,36 @@ export default function App(): React.JSX.Element {
       try {
         writeLog('WARN', '[SYSTEM] Initiating full system teardown matrix...');
 
-        // 1. Fetch current subscriptions to perform a clean sweep unsubscribe
+        const currentConfig = await getEngineConfig();
+        if (currentConfig) {
+          writeLog(
+            'INFO',
+            `[API] Dispatching manual status teardown notice for: ${currentConfig.id}`,
+          );
+          fetch('https://cm-bps.vercel.app/api/engine/ping', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Engine-Token':
+                '38d6960a32cda66ce327d44d358755f706420303e11825a34eca38544a07e2c7',
+            },
+
+            body: JSON.stringify({
+              engineId: currentConfig.id,
+              status: 'OFF',
+            }),
+          }).catch(err => {
+            // Fallback context swallowed safely to prevent app UI hangs during device disconnection
+            writeLog(
+              'WARN',
+              `[API] Silent drop encountered during state shutdown broadcast: ${String(
+                err,
+              )}`,
+            );
+          });
+        }
+
+        // Fetch current subscriptions to perform a clean sweep unsubscribe
         const statusMeta = await AsyncStorage.getItem('@printer_engine_status');
         if (statusMeta) {
           const parsedStatus = JSON.parse(statusMeta);
@@ -982,7 +991,7 @@ export default function App(): React.JSX.Element {
           }
         }
 
-        // 2. Disconnect only if currently connected or initializing
+        // Disconnect only if currently connected or initializing
         writeLog(
           'INFO',
           '[PUSHER] Terminating native socket instance safely...',
@@ -995,10 +1004,15 @@ export default function App(): React.JSX.Element {
           `[PUSHER] Teardown lifecycle exception: ${String(disconnectError)}`,
         );
       } finally {
-        // 3. Clean up the loop interval and reset state completely
+        // Clean up the loop interval and reset state completely
         if (globalThis.engineHeartbeatInterval) {
           clearInterval(globalThis.engineHeartbeatInterval);
           globalThis.engineHeartbeatInterval = null;
+        }
+
+        if (globalThis.printerWarmupInterval) {
+          clearInterval(globalThis.printerWarmupInterval);
+          globalThis.printerWarmupInterval = null;
         }
 
         ReactNativeForegroundService.remove_task('printerOrderPollingTask');
@@ -1056,12 +1070,15 @@ export default function App(): React.JSX.Element {
       ReactNativeForegroundService.add_task(
         async () => {
           try {
-            // ─── 1. CORE HARHARDENED CLUSTER PING ───
             const enginePingResponse = await fetch(
               'https://cm-bps.vercel.app/api/engine/ping',
               {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Engine-Token':
+                    '38d6960a32cda66ce327d44d358755f706420303e11825a34eca38544a07e2c7',
+                },
                 body: JSON.stringify({
                   engineId: verifiedConfig.id,
                   priority: verifiedConfig.priority,
@@ -1078,6 +1095,12 @@ export default function App(): React.JSX.Element {
                 clearInterval(globalThis.engineHeartbeatInterval);
                 globalThis.engineHeartbeatInterval = null;
               }
+
+              if (globalThis.printerWarmupInterval) {
+                clearInterval(globalThis.printerWarmupInterval);
+                globalThis.printerWarmupInterval = null;
+              }
+
               ReactNativeForegroundService.remove_task(
                 'printerOrderPollingTask',
               );
@@ -1095,7 +1118,6 @@ export default function App(): React.JSX.Element {
               return;
             }
 
-            // ─── 2. RELIABLE BACKGROUND HEARTBEAT LOOP ───
             const PING_INTERVAL_MS = 5 * 60 * 1000;
             if (!globalThis.engineHeartbeatInterval) {
               globalThis.engineHeartbeatInterval = setInterval(async () => {
@@ -1104,7 +1126,11 @@ export default function App(): React.JSX.Element {
                     'https://cm-bps.vercel.app/api/engine/ping',
                     {
                       method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'X-Engine-Token':
+                          '38d6960a32cda66ce327d44d358755f706420303e11825a34eca38544a07e2c7',
+                      },
                       body: JSON.stringify({
                         engineId: verifiedConfig.id,
                         priority: verifiedConfig.priority,
@@ -1117,6 +1143,12 @@ export default function App(): React.JSX.Element {
                       clearInterval(globalThis.engineHeartbeatInterval);
                       globalThis.engineHeartbeatInterval = null;
                     }
+
+                    if (globalThis.printerWarmupInterval) {
+                      clearInterval(globalThis.printerWarmupInterval);
+                      globalThis.printerWarmupInterval = null;
+                    }
+
                     ReactNativeForegroundService.remove_task(
                       'printerOrderPollingTask',
                     );
@@ -1133,9 +1165,16 @@ export default function App(): React.JSX.Element {
               }, PING_INTERVAL_MS);
             }
 
-            // ─── 3. FETCH CONFIGURATION MATRICES ───
             const response: Response = await fetch(
               'https://cm-bps.vercel.app/api/counters',
+              {
+                method: 'GET',
+                headers: {
+                  Accept: 'application/json',
+                  'X-Engine-Token':
+                    '38d6960a32cda66ce327d44d358755f706420303e11825a34eca38544a07e2c7',
+                },
+              },
             );
             const result: any = await response.json();
 
@@ -1143,9 +1182,6 @@ export default function App(): React.JSX.Element {
               return;
             const activeCounters: CounterConfig[] =
               result.data as CounterConfig[];
-
-            // Read printer array safely out of disk snapshot rather than hitting component thread refs
-            const safeDiscoveredPrinters = await getCachedDiscoveredPrinters();
 
             for (const counter of activeCounters) {
               if (
@@ -1157,6 +1193,65 @@ export default function App(): React.JSX.Element {
               await warmPrinterConnection(
                 counter.printerType as 'BT' | 'USB',
                 counter.printerAddress,
+              );
+            }
+
+            const WARMUP_INTERVAL_MS: number = 2 * 60 * 1000;
+
+            if (!globalThis.printerWarmupInterval) {
+              globalThis.printerWarmupInterval = setInterval(
+                async (): Promise<void> => {
+                  writeLog(
+                    'INFO',
+                    '[HEARTBEAT] Firing anti-decay printer warmup cycle...',
+                  );
+
+                  try {
+                    // Renamed from 'response' to 'warmupResponse'
+                    const warmupResponse = await fetch(
+                      'https://cm-bps.vercel.app/api/counters',
+                      {
+                        method: 'GET',
+                        headers: {
+                          Accept: 'application/json',
+                          'X-Engine-Token':
+                            '38d6960a32cda66ce327d44d358755f706420303e11825a34eca38544a07e2c7',
+                        },
+                      },
+                    );
+                    // Renamed from 'result' to 'warmupResult'
+                    const warmupResult = await warmupResponse.json();
+
+                    if (
+                      warmupResult &&
+                      warmupResult.success &&
+                      Array.isArray(warmupResult.data)
+                    ) {
+                      const freshCounters: CounterConfig[] =
+                        warmupResult.data as CounterConfig[];
+                      for (const counter of freshCounters) {
+                        if (
+                          !counter.printerAddress ||
+                          counter.printerType === 'NONE' ||
+                          counter.printerType === 'LAN'
+                        )
+                          continue;
+                        await warmPrinterConnection(
+                          counter.printerType as 'BT' | 'USB',
+                          counter.printerAddress,
+                        );
+                      }
+                    }
+                  } catch (err: unknown) {
+                    writeLog(
+                      'WARN',
+                      `[HEARTBEAT] Failed to fetch fresh counters for warmup: ${String(
+                        err,
+                      )}`,
+                    );
+                  }
+                },
+                WARMUP_INTERVAL_MS,
               );
             }
 
@@ -1178,10 +1273,33 @@ export default function App(): React.JSX.Element {
 
             for (const channelName of currentChannels) {
               try {
+                // Explicit clean-slate sweep
+                writeLog(
+                  'INFO',
+                  `[TASK-LIFECYCLE] Purging stale channel space: ${channelName}`,
+                );
+                await headlessPusher.unsubscribe({ channelName });
+              } catch {
+                // Expected to fail if init() already wiped the internal map, safe to ignore
+              }
+
+              try {
                 await headlessPusher.subscribe({
                   channelName,
-                  onSubscriptionSucceeded: () => {},
-                  onSubscriptionError: () => {},
+                  onSubscriptionSucceeded: () => {
+                    writeLog(
+                      'INFO',
+                      `[PUSHER-SUB] Active pipeline confirmed for channel: ${channelName}`,
+                    );
+                  },
+                  onSubscriptionError: (message: string, error) => {
+                    writeLog(
+                      'ERROR',
+                      `[PUSHER-SUB] Subscription rejected for ${channelName}! Msg: ${message} | Context: ${JSON.stringify(
+                        error,
+                      )}`,
+                    );
+                  },
                   onEvent: async (event: PusherEvent) => {
                     if (event.eventName !== 'NEW_ORDER') return;
 
@@ -1222,7 +1340,6 @@ export default function App(): React.JSX.Element {
                         matchedCounter.status === 'ACTIVE' &&
                         matchedCounter.printerType !== 'NONE'
                       ) {
-                        // ─── BOUNDED AND PROTECTED CONCURRENCY LOCK ───
                         let attempts = 0;
                         let locked = false;
                         while (
@@ -1230,11 +1347,12 @@ export default function App(): React.JSX.Element {
                           attempts < 10
                         ) {
                           locked = true;
-                          await new Promise<void>(r => setTimeout(r, 1500));
+                          await new Promise<void>(r =>
+                            setTimeout(() => r(), 1500),
+                          );
                           attempts++;
                         }
 
-                        // Guard: If the queue wait limits break or time out, drop to prevent execution races
                         if (headlessPrintingLocks[printerAddress] && locked) {
                           await updateJournalTicketStatus(
                             actionableTicket.orderId,
@@ -1244,31 +1362,124 @@ export default function App(): React.JSX.Element {
                           return;
                         }
 
+                        // Explicit declaration of the engine shutdown sequence to avoid repeated catch-block redundancy
+                        const terminateEngineLocally = async () => {
+                          try {
+                            writeLog(
+                              'WARN',
+                              '[FATAL-SHUTDOWN] Executing hard native engine teardown matrix...',
+                            );
+
+                            if (globalThis.engineHeartbeatInterval) {
+                              clearInterval(globalThis.engineHeartbeatInterval);
+                              globalThis.engineHeartbeatInterval = null;
+                            }
+
+                            if (globalThis.printerWarmupInterval) {
+                              clearInterval(globalThis.printerWarmupInterval);
+                              globalThis.printerWarmupInterval = null;
+                            }
+
+                            const fatalPusherDisconnect = Pusher.getInstance();
+                            await fatalPusherDisconnect
+                              .disconnect()
+                              .catch(() => {});
+
+                            ReactNativeForegroundService.remove_task(
+                              'printerOrderPollingTask',
+                            );
+                            await ReactNativeForegroundService.stop().catch(
+                              () => {},
+                            );
+
+                            await AsyncStorage.removeItem(
+                              '@printer_engine_status',
+                            ).catch(() => {});
+                          } catch (shutdownError) {
+                            writeLog(
+                              'ERROR',
+                              `[FATAL-SHUTDOWN] Native thread breakdown: ${String(
+                                shutdownError,
+                              )}`,
+                            );
+                          }
+                          DeviceEventEmitter.emit('FORCE_STOP_SERVER_UI');
+                        };
+
                         try {
                           headlessPrintingLocks[printerAddress] = true;
 
-                          const matchedPrinterDevice =
-                            safeDiscoveredPrinters.find(
-                              (dp: DiscoveredPrinter) =>
-                                dp.address === printerAddress,
+                          await updateJournalTicketStatus(
+                            actionableTicket.orderId,
+                            'PRINTING',
+                          );
+
+                          try {
+                            await executePrintJob(
+                              matchedCounter.printerType as
+                                | 'LAN'
+                                | 'BT'
+                                | 'USB',
+                              printerAddress,
+                              actionableTicket,
+                            );
+                            writeLog(
+                              'INFO',
+                              `[ENGINE] Hardware buffer flush confirmed for order: ${actionableTicket.orderId}`,
+                            );
+                          } catch (hardwareError) {
+                            writeLog(
+                              'ERROR',
+                              `[PRINTER-HARDWARE] Physical print failed for order ${
+                                actionableTicket.orderId
+                              }: ${String(
+                                hardwareError,
+                              )}. Shutting down engine pipeline...`,
                             );
 
-                          await executePrintJob(
-                            matchedCounter.printerType as 'LAN' | 'BT' | 'USB',
-                            printerAddress,
-                            actionableTicket,
-                            matchedPrinterDevice,
-                          );
+                            // Hard recovery: Roll local status back to PENDING so cron handles refund safety rules
+                            await updateJournalTicketStatus(
+                              actionableTicket.orderId,
+                              'PENDING',
+                            ).catch(() => {});
+
+                            // Stop hardware tasks and disconnect loops instantly
+                            await terminateEngineLocally();
+
+                            Alert.alert(
+                              '🖨️ HARDWARE PRINT FAILURE',
+                              `Printer hardware failed to emit receipt for Token No: ${
+                                actionableTicket.ticketReference || 'XXXX'
+                              }. Engine stopped. Order state marked as PENDING to authorize cron refunds.`,
+                              [{ text: 'ACKNOWLEDGE' }],
+                            );
+                            return;
+                          }
 
                           await updateJournalTicketStatus(
                             actionableTicket.orderId,
                             'COMPLETED',
                           );
-                        } catch {
+                        } catch (pipelineFatalError: unknown) {
+                          writeLog(
+                            'ERROR',
+                            `[FATAL-PIPELINE] Aborting print stream to prevent split-brain state. Order: ${
+                              actionableTicket.orderId
+                            }. Error: ${String(pipelineFatalError)}`,
+                          );
+
                           await updateJournalTicketStatus(
                             actionableTicket.orderId,
                             'CANCELLED',
                           ).catch(() => {});
+
+                          await terminateEngineLocally();
+
+                          Alert.alert(
+                            '⚠️ CRITICAL API FAILURE',
+                            `Could not synchronize order status with cloud servers. The printing engine has been terminated safely to prevent invalid customer coupons.\n\nOrder ID: ${actionableTicket.orderId}`,
+                            [{ text: 'ACKNOWLEDGE' }],
+                          );
                         } finally {
                           headlessPrintingLocks[printerAddress] = false;
                           DeviceEventEmitter.emit('JOURNAL_UPDATED');
@@ -1342,7 +1553,6 @@ export default function App(): React.JSX.Element {
         printer.type || 'LAN',
         printer.address || '',
         mockTicket,
-        printer,
       );
       Alert.alert('Success', 'Test receipt sent to hardware.');
     } catch (err: unknown) {
@@ -1361,15 +1571,10 @@ export default function App(): React.JSX.Element {
     );
     try {
       const mockTicket: Ticket = generateMockTicket(counter.id);
-      const cachedPrinter: DiscoveredPrinter | undefined =
-        discoveredPrintersRef.current.find(
-          (dp: DiscoveredPrinter) => dp.address === counter.printerAddress,
-        );
       await runHardwarePrint(
         counter.printerType,
         counter.printerAddress,
         mockTicket,
-        cachedPrinter,
       );
       Alert.alert('Success', `Test receipt sent to ${counter.displayName}.`);
     } catch (err: unknown) {
@@ -1384,7 +1589,17 @@ export default function App(): React.JSX.Element {
   const fetchCounters = useCallback(async (): Promise<void> => {
     try {
       writeLog('INFO', '[API] Fetching counter list...');
-      const response: Response = await fetch(`${apiUrl}/api/counters`);
+      const response: Response = await fetch(
+        'https://cm-bps.vercel.app/api/counters',
+        {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            'X-Engine-Token':
+              '38d6960a32cda66ce327d44d358755f706420303e11825a34eca38544a07e2c7',
+          },
+        },
+      );
       const result: any = await response.json();
       if (result.success) {
         writeLog('INFO', `[API] ${result.data.length} counter(s) loaded.`);
@@ -1394,7 +1609,7 @@ export default function App(): React.JSX.Element {
     } catch (err: unknown) {
       writeLog('ERROR', `[API] Failed to fetch counters: ${String(err)}`);
     }
-  }, [apiUrl]);
+  }, []);
 
   const registerCounter = async (printer: DiscoveredPrinter): Promise<void> => {
     if (!newCounterNum || !newCounterName) {
@@ -1411,7 +1626,11 @@ export default function App(): React.JSX.Element {
       );
       const response: Response = await fetch(`${apiUrl}/api/counters`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Engine-Token':
+            '38d6960a32cda66ce327d44d358755f706420303e11825a34eca38544a07e2c7',
+        },
         body: JSON.stringify({
           counterNumber: parseInt(newCounterNum, 10),
           displayName: newCounterName,
@@ -1491,6 +1710,16 @@ export default function App(): React.JSX.Element {
   }, []);
 
   useEffect(() => {
+    const synchronizeDatabaseOnLaunch = async () => {
+      writeLog('INFO', '[SYNC] Cold start reconciliation initialized...');
+      await reconcileMissingJournalTickets();
+      DeviceEventEmitter.emit('JOURNAL_UPDATED');
+    };
+
+    synchronizeDatabaseOnLaunch();
+  }, []);
+
+  useEffect(() => {
     let stopBtScanning: (() => void) | null = null;
     let scanTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -1513,9 +1742,25 @@ export default function App(): React.JSX.Element {
       try {
         const nativePusher: Pusher = Pusher.getInstance();
 
+        // Clean up any lingering subscriptions from a previous UI session if possible
+        // before we call disconnect/init
         try {
-          await nativePusher.disconnect();
+          const storedStatus = await AsyncStorage.getItem(
+            '@printer_engine_status',
+          );
+          if (storedStatus) {
+            const parsed = JSON.parse(storedStatus);
+            if (Array.isArray(parsed.channels)) {
+              for (const chan of parsed.channels) {
+                await nativePusher
+                  .unsubscribe({ channelName: chan })
+                  .catch(() => {});
+              }
+            }
+          }
         } catch {}
+
+        await nativePusher.disconnect().catch(() => {});
 
         await nativePusher.init({
           apiKey: 'de978c89a0a60f82aefd',
