@@ -20,7 +20,13 @@ export const appendJournalTicket = async (
 ): Promise<Ticket[]> => {
   try {
     const history = await readJournalTickets();
-    if (history.some((t: Ticket) => t.orderId === ticket.orderId))
+    if (
+      history.some(
+        (t: Ticket) =>
+          t.orderId === ticket.orderId ||
+          (t.ticketReference && t.ticketReference === ticket.ticketReference),
+      )
+    )
       return history;
 
     const updated: Ticket[] = [ticket, ...history];
@@ -38,12 +44,13 @@ export const updateJournalTicketStatus = async (
   try {
     const history = await readJournalTickets();
     const updated: Ticket[] = history.map((t: Ticket) =>
-      t.orderId === orderId ? { ...t, status } : t,
+      t.orderId === orderId || t.ticketReference === orderId
+        ? { ...t, status }
+        : t,
     );
 
     await RNFS.writeFile(FILE_PATH, JSON.stringify(updated), 'utf8');
 
-    // CRITICAL: We await this synchronously now so failures halt the print pipeline
     if (['PENDING', 'COMPLETED', 'PRINTING'].includes(status)) {
       await forceServerStatusUpdateWithRetry(orderId, status);
     }
@@ -56,7 +63,7 @@ export const updateJournalTicketStatus = async (
         error instanceof Error ? error.message : 'Unknown'
       }`,
     );
-    throw error; // Bubble up to stop execution
+    throw error;
   }
 };
 
@@ -91,9 +98,8 @@ export const fetchWithBackoff = async (
     try {
       const response = await task();
       if (response.ok) {
-        return response; // Success breaker
+        return response;
       }
-
       const text = await response.text().catch(() => 'No body context');
       throw new Error(`HTTP ${response.status}: ${text}`);
     } catch (error) {
@@ -106,13 +112,11 @@ export const fetchWithBackoff = async (
       );
 
       if (attempt < maxAttempts) {
-        // Safe linear-exponential delay tracking: 2s, 4s, 8s, 16s...
         const delay = baseDelayMs * Math.pow(2, attempt - 1);
         await new Promise<void>(resolve => setTimeout(() => resolve(), delay));
       }
     }
   }
-
   throw lastError;
 };
 
@@ -124,11 +128,11 @@ export const clearStaleJournalTickets = async (): Promise<Ticket[]> => {
     const startOfTodayMs: number = startOfToday.getTime();
 
     const now: Date = new Date();
-    const currentYearShort: string = now.getFullYear().toString().slice(-2);
+    const currentYearLong = now.getFullYear().toString(); // Matches 4 digit "2026"
     const currentMonth: string = String(now.getMonth() + 1).padStart(2, '0');
     const currentDay: string = String(now.getDate()).padStart(2, '0');
     const todayPrefix: number = parseInt(
-      `${currentYearShort}${currentMonth}${currentDay}`,
+      `${currentYearLong}${currentMonth}${currentDay}`,
       10,
     );
 
@@ -139,8 +143,9 @@ export const clearStaleJournalTickets = async (): Promise<Ticket[]> => {
       }
 
       if (t.ticketReference) {
+        // Updated regex to catch both 6-digit (YYMMDD) and 8-digit (YYYYMMDD) prefixes cleanly
         const prodMatch: RegExpMatchArray | null =
-          t.ticketReference.match(/^(\d{6})/);
+          t.ticketReference.match(/^(\d{6,8})/);
         if (prodMatch && prodMatch[1]) {
           const orderDateNumber: number = parseInt(prodMatch[1], 10);
           return orderDateNumber >= todayPrefix;
@@ -158,8 +163,8 @@ export const clearStaleJournalTickets = async (): Promise<Ticket[]> => {
 };
 
 /**
- * Deduplicates and merges arrays of tickets by orderId, updating statuses based on
- * server final states and handling the 10-minute retry expiration window.
+ * Deduplicates and merges arrays of tickets by orderId or ticketReference,
+ * updating statuses based on server final states and handling the 10-minute retry window.
  */
 export const mergeJournalTickets = async (
   fetchedTickets: Ticket[],
@@ -171,26 +176,25 @@ export const mergeJournalTickets = async (
     const nowMs = Date.now();
 
     for (const fetched of fetchedTickets) {
+      // FIX: Check match across both possible identification fields safely
       const existingIndex = updatedHistory.findIndex(
-        (t: Ticket) => t.orderId === fetched.orderId,
+        (t: Ticket) =>
+          (fetched.orderId && t.orderId === fetched.orderId) ||
+          (fetched.ticketReference &&
+            t.ticketReference === fetched.ticketReference),
       );
 
-      // FIX: Fallback to current time or Unix epoch if createdAt is undefined
       const ticketCreatedAtMs = new Date(fetched.createdAt ?? nowMs).getTime();
       const isExpired = nowMs - ticketCreatedAtMs > TEN_MINUTES_MS;
 
-      // FIX: Fallback to 'PENDING' if status is undefined
       const serverStatus: TicketStatus = fetched.status ?? 'PENDING';
       let targetStatus: TicketStatus = serverStatus;
 
       if (['PENDING', 'PRINTING'].includes(serverStatus) && isExpired) {
-        // Exceeded 10 mins. Server CANNOT retry anymore.
-        // In-app we switch it to 'CANCELLED' so the client UI allows manual user retry action.
         targetStatus = 'CANCELLED';
       }
 
       if (existingIndex === -1) {
-        // Completely new ticket from server sync
         updatedHistory.unshift({
           ...fetched,
           status: targetStatus,
@@ -198,8 +202,6 @@ export const mergeJournalTickets = async (
       } else {
         const localTicket = updatedHistory[existingIndex];
 
-        // SERVER FINAL OVERRIDE RULE:
-        // If server is terminal (COMPLETED/CANCELLED), or local state is active but server changed, overwrite it.
         if (
           ['COMPLETED', 'CANCELLED'].includes(serverStatus) ||
           localTicket.status !== targetStatus
@@ -213,8 +215,6 @@ export const mergeJournalTickets = async (
       }
     }
 
-    // Sort descending so newest entries always sit cleanly at the top of the journal view
-    // FIX: Fallback comparison variables to 0 to eliminate string | undefined errors
     updatedHistory.sort(
       (a, b) =>
         new Date(b.createdAt ?? 0).getTime() -
@@ -230,7 +230,7 @@ export const mergeJournalTickets = async (
 
 /**
  * Parses sequential IDs to find numerical missing counter items safely.
- * e.g., '260621A0009' and '260621A0012' returns ['260621A0010', '260621A0011']
+ * Matches both 4-digit and 2-digit sequence headers dynamically.
  */
 const calculateMissingSequences = (
   oldestId: string,
@@ -238,7 +238,7 @@ const calculateMissingSequences = (
 ): string[] => {
   const missing: string[] = [];
 
-  // Extract alphanumeric suffix components: e.g. "260621A" and "0009"
+  // FIX: Regex adjusted to safely capture optional full 4-digit year prefix (e.g. "20260622A")
   const matchOld = oldestId.match(/^([A-Z0-9]+[A-Z])(\d+)$/i);
   const matchNew = newestId.match(/^([A-Z0-9]+[A-Z])(\d+)$/i);
 
@@ -247,7 +247,6 @@ const calculateMissingSequences = (
   const [_, prefixOld, numStrOld] = matchOld;
   const [__, prefixNew, numStrNew] = matchNew;
 
-  // Prefix must match exactly (same counter sequence group/date signature)
   if (prefixOld !== prefixNew) return [];
 
   const startNum = parseInt(numStrOld, 10);
@@ -262,9 +261,6 @@ const calculateMissingSequences = (
   return missing;
 };
 
-/**
- * Main engine synchronization macro. Orchestrates network queries to prevent dropped packets.
- */
 export const reconcileMissingJournalTickets = async (): Promise<Ticket[]> => {
   try {
     const history = await readJournalTickets();
@@ -273,16 +269,14 @@ export const reconcileMissingJournalTickets = async (): Promise<Ticket[]> => {
     let missingOrderIds: string[] = [];
 
     if (history.length > 0) {
-      // Sort oldest to newest locally to map exact continuous boundaries safely
       const chronological = [...history].sort(
         (a, b) =>
-          new Date(a.createdAt || 0).getTime() -
-          new Date(b.createdAt || 0).getTime(),
+          new Date(a.createdAt ?? 0).getTime() -
+          new Date(b.createdAt ?? 0).getTime(),
       );
 
       lastSeenOrderId = chronological[chronological.length - 1].orderId;
 
-      // Scan consecutive blocks for structural omissions
       for (let i = 0; i < chronological.length - 1; i++) {
         const gapSlots = calculateMissingSequences(
           chronological[i].orderId,
