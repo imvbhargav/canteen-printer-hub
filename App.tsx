@@ -1363,48 +1363,83 @@ export default function App(): React.JSX.Element {
                         }
 
                         // Explicit declaration of the engine shutdown sequence to avoid repeated catch-block redundancy
-                        const terminateEngineLocally = async () => {
-                          try {
-                            writeLog(
-                              'WARN',
-                              '[FATAL-SHUTDOWN] Executing hard native engine teardown matrix...',
-                            );
+                        const terminateEngineLocally =
+                          async (): Promise<void> => {
+                            try {
+                              writeLog(
+                                'WARN',
+                                '[FATAL-SHUTDOWN] Executing graceful native engine teardown matrix...',
+                              );
 
-                            if (globalThis.engineHeartbeatInterval) {
-                              clearInterval(globalThis.engineHeartbeatInterval);
-                              globalThis.engineHeartbeatInterval = null;
+                              fetch(
+                                'https://cm-bps.vercel.app/api/engine/ping',
+                                {
+                                  method: 'POST',
+                                  headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-Engine-Token':
+                                      '38d6960a32cda66ce327d44d358755f706420303e11825a34eca38544a07e2c7',
+                                  },
+                                  body: JSON.stringify({
+                                    engineId: verifiedConfig.id,
+                                    status: 'OFF',
+                                  }),
+                                },
+                              ).catch((): void => {});
+
+                              if (globalThis.engineHeartbeatInterval) {
+                                clearInterval(
+                                  globalThis.engineHeartbeatInterval,
+                                );
+                                globalThis.engineHeartbeatInterval = null;
+                              }
+
+                              if (globalThis.printerWarmupInterval) {
+                                clearInterval(globalThis.printerWarmupInterval);
+                                globalThis.printerWarmupInterval = null;
+                              }
+
+                              const fatalPusherDisconnect: Pusher =
+                                Pusher.getInstance();
+
+                              const channelArray: string[] =
+                                Array.from(currentChannels);
+                              for (const chnlName of channelArray) {
+                                await fatalPusherDisconnect
+                                  .unsubscribe({ channelName: chnlName })
+                                  .catch((): void => {});
+                              }
+
+                              await fatalPusherDisconnect
+                                .disconnect()
+                                .catch((): void => {});
+
+                              ReactNativeForegroundService.remove_task(
+                                'printerOrderPollingTask',
+                              );
+                              await ReactNativeForegroundService.stop().catch(
+                                (): void => {},
+                              );
+
+                              await AsyncStorage.removeItem(
+                                '@printer_engine_status',
+                              ).catch((): void => {});
+
+                              DeviceEventEmitter.emit('ENGINE_STATUS_CHANGED', {
+                                connected: false,
+                                channels: [],
+                                updatedAt: new Date().toLocaleTimeString(),
+                              });
+                            } catch (shutdownError: unknown) {
+                              writeLog(
+                                'ERROR',
+                                `[FATAL-SHUTDOWN] Native thread breakdown: ${String(
+                                  shutdownError,
+                                )}`,
+                              );
                             }
-
-                            if (globalThis.printerWarmupInterval) {
-                              clearInterval(globalThis.printerWarmupInterval);
-                              globalThis.printerWarmupInterval = null;
-                            }
-
-                            const fatalPusherDisconnect = Pusher.getInstance();
-                            await fatalPusherDisconnect
-                              .disconnect()
-                              .catch(() => {});
-
-                            ReactNativeForegroundService.remove_task(
-                              'printerOrderPollingTask',
-                            );
-                            await ReactNativeForegroundService.stop().catch(
-                              () => {},
-                            );
-
-                            await AsyncStorage.removeItem(
-                              '@printer_engine_status',
-                            ).catch(() => {});
-                          } catch (shutdownError) {
-                            writeLog(
-                              'ERROR',
-                              `[FATAL-SHUTDOWN] Native thread breakdown: ${String(
-                                shutdownError,
-                              )}`,
-                            );
-                          }
-                          DeviceEventEmitter.emit('FORCE_STOP_SERVER_UI');
-                        };
+                            DeviceEventEmitter.emit('FORCE_STOP_SERVER_UI');
+                          };
 
                         try {
                           headlessPrintingLocks[printerAddress] = true;
